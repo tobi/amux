@@ -1,0 +1,43 @@
+{
+  "name": "amux",
+  "version": "0.1.0",
+  "description": "Agentic mux — named tmux panels for AI agents and humans",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "amux": "bin/amux"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "pi": {
+    "extensions": ["./ext/index.ts"],
+    "skills": ["./skills"]
+  },
+  "files": [
+    "src",
+    "bin",
+    "conf",
+    "ext",
+    "skills"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "test:unit": "bun test test/unit.test.ts",
+    "test:integration": "bun test test/integration.test.ts"
+  },
+  "dependencies": {
+    "@xterm/headless": "^6.0.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": { "optional": true },
+    "@mariozechner/pi-ai": { "optional": true },
+    "@sinclair/typebox": { "optional": true }
+  }
+}

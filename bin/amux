@@ -1,0 +1,156 @@
+#!/usr/bin/env bun
+
+import {
+  list, watch, panels, terminate, shell, sendKeys, read, kill,
+  AmuxError,
+} from "../src/amux.ts";
+
+const HELP = `amux — agentic mux
+
+Named panels backed by tmux. Created on first use, persistent across commands.
+
+For humans:
+  amux watch                see all panels live (read-only, Ctrl-Q to detach)
+  amux watch -r             attach read-only (can't type into panels)
+  amux list                 show active panels
+  amux terminate --yes      shut down all panels
+
+  Inside watch mode:
+    M-1..9                  switch between panels
+    Esc                     scroll mode (copy-mode)
+    M-q                     detach
+    M-t                     terminate all panels
+
+For agents:
+  amux NAME shell CMD...    run command in a panel, stream output back
+  amux NAME send-keys K...  send keystrokes to a panel
+  amux NAME read [--full]   capture panel buffer (--full for scrollback)
+  amux NAME kill            remove a single panel
+
+Options:
+  -tN                       timeout in seconds (default: -t5)
+
+send-keys reference:
+  C-c C-d C-z               ctrl combos
+  Enter Tab Esc Space       special keys
+  Up Down Left Right        arrow keys
+  BSpace                    backspace
+  "some text"               literal text (no Enter added)
+
+Examples:
+  amux server shell "npm start"           start a dev server
+  amux watch                              see it running
+  amux server read                        check its output
+  amux server send-keys C-c               interrupt it
+  amux repl shell "irb"                   start a REPL
+  amux repl send-keys "puts :hi" Enter    type + enter
+  amux repl send-keys C-d                 EOF to exit
+  amux server kill                        remove one panel
+  amux terminate --yes                    shut down everything
+`;
+
+// Parse -tN timeout flag from anywhere in args (default: 5s)
+const args = process.argv.slice(2);
+let timeout = 5;
+const tIdx = args.findIndex((a) => /^-t\d+$/.test(a));
+if (tIdx !== -1) {
+  timeout = parseInt(args[tIdx].slice(2), 10);
+  args.splice(tIdx, 1);
+}
+
+const COMMANDS = ["shell", "send-keys", "read", "kill"];
+
+try {
+  switch (args[0]) {
+    case "list":
+      list();
+      process.exit(0);
+
+    case "terminate":
+      if (!args.includes("--yes")) {
+        const p = panels();
+        const entries = Object.entries(p);
+        if (entries.length > 0) {
+          console.log("active panels:");
+          entries
+            .sort((a, b) => a[1].index - b[1].index)
+            .forEach(([name, meta]) => {
+              console.log(`  ${meta.index}\t${name}\t${meta.id}`);
+            });
+        }
+        process.stderr.write("confirm with: amux terminate --yes\n");
+        process.exit(1);
+      }
+      terminate();
+      console.log("session destroyed");
+      process.exit(0);
+
+    case "watch":
+    case "attach":
+      watch({ readonly: args.includes("-r") });
+      break; // unreachable — watch calls process.exit
+
+    case undefined:
+    case "-h":
+    case "--help":
+    case "help":
+      process.stderr.write(HELP);
+      process.exit(0);
+  }
+
+  // Panel commands: amux NAME COMMAND [ARGS...]
+  const name = args[0];
+  const cmd = args[1];
+
+  if (!cmd || !COMMANDS.includes(cmd)) {
+    process.stderr.write(HELP);
+    process.exit(1);
+  }
+
+  const rest = args.slice(2);
+
+  switch (cmd) {
+    case "shell": {
+      const command = rest.length === 1 ? rest[0] : rest.join(" ");
+      if (!command) {
+        process.stderr.write(HELP);
+        process.exit(1);
+      }
+      const shellTimedOut = shell(name, command, { timeout });
+      if (shellTimedOut) {
+        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} read\` to check output.\n`);
+      }
+      break;
+    }
+
+    case "send-keys": {
+      if (rest.length === 0) {
+        process.stderr.write(HELP);
+        process.exit(1);
+      }
+      const keysTimedOut = sendKeys(name, rest, { timeout });
+      if (keysTimedOut) {
+        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} read\` to check output.\n`);
+      }
+      break;
+    }
+
+    case "read": {
+      const full = rest.includes("--full");
+      process.stdout.write(read(name, { full }));
+      break;
+    }
+
+    case "kill": {
+      kill(name);
+      console.log(`- ${name}`);
+      break;
+    }
+  }
+} catch (e) {
+  if (e instanceof AmuxError) {
+    process.stderr.write(`amux: ${e.message}\n`);
+    process.exit(1);
+  }
+  throw e;
+}
