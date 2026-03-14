@@ -7,11 +7,13 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
-import { spawnSync } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // -- activity tracking --------------------------------------------------------
 
@@ -61,8 +63,7 @@ function activePanels(): string[] {
 // -- amux helpers (shell out to the amux CLI) ---------------------------------
 
 function amuxBin(): string {
-  // Resolve relative to this extension
-  return join(import.meta.dir, "..", "bin", "amux");
+  return join(__dirname, "..", "bin", "amux");
 }
 
 function amux(args: string[], timeout = 10): { stdout: string; exitCode: number } {
