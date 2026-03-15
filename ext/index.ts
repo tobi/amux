@@ -91,6 +91,10 @@ const BLINK_MS = 2000;          // blink for 2s after new output on non-trailed 
 const panelLogSizes: Record<string, number> = {};
 // Timestamp of last new-output event per panel (for blink effect)
 const panelBlinkUntil: Record<string, number> = {};
+// Rolling byte count: [timestamp, bytes][] — recent output volume per panel
+const panelOutputLog: Record<string, [number, number][]> = {};
+const BURST_WINDOW_MS = 10_000; // 10s window
+const BURST_THRESHOLD = 500;    // bytes in window to count as "burst"
 
 function discoverAllPanels(): PanelState[] {
   try {
@@ -107,10 +111,19 @@ function discoverAllPanels(): PanelState[] {
         hot = (now - st.mtimeMs) < HOT_MS;
         lastActivityMs = st.mtimeMs;
 
-        // Detect new output → trigger blink on non-trailed panels
+        // Detect new output → trigger highlight on non-trailed panels
         const prevSize = panelLogSizes[name] ?? st.size;
-        if (st.size > prevSize && name !== trailPanel) {
-          panelBlinkUntil[name] = now + BLINK_MS;
+        const delta = st.size - prevSize;
+        if (delta > 0) {
+          // Record output volume
+          if (!panelOutputLog[name]) panelOutputLog[name] = [];
+          panelOutputLog[name].push([now, delta]);
+          // Prune old entries
+          panelOutputLog[name] = panelOutputLog[name].filter(([t]) => now - t < BURST_WINDOW_MS);
+
+          if (name !== trailPanel) {
+            panelBlinkUntil[name] = now + BLINK_MS;
+          }
         }
         panelLogSizes[name] = st.size;
       } catch {}
@@ -295,7 +308,15 @@ function installTabBarWidget(ctx: ExtensionContext): void {
         const key = n <= 9 ? grayDim(`⌥${n} `) : "";
 
         if (hasFreshOutput) {
-          // Fresh output: bright blue (light/bold) — subtle attention
+          // Check output volume in last 10s — burst gets extra bright
+          const recentBytes = (panelOutputLog[p.name] || [])
+            .filter(([t]) => now - t < BURST_WINDOW_MS)
+            .reduce((sum, [, b]) => sum + b, 0);
+          if (recentBytes > BURST_THRESHOLD) {
+            // Burst: white bold — high activity
+            return key + `\x1b[97;1m${p.name}${RESET}`;
+          }
+          // Fresh output: bright blue bold — subtle attention
           return key + `\x1b[94;1m${p.name}${RESET}`;
         }
         if (p.hot) {
