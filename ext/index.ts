@@ -666,7 +666,7 @@ export default function (pi: ExtensionAPI) {
   // --- command: /amux ---
 
   pi.registerCommand("amux", {
-    description: "Manage amux — /amux (toggle trail), /amux install (add to PATH), /amux <cmd> (run in shell panel)",
+    description: "Manage amux — /amux <panel> (trail panel), /amux install (add to PATH), /amux (toggle trail)",
     handler: async (args, ctx) => {
       const sub = args.trim();
 
@@ -711,8 +711,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // /amux <shell command> — fire into "shell" panel, show trail
+      // /amux <name> — trail that panel (or create + trail if it looks like a panel name)
       if (sub) {
+        const all = discoverAllPanels();
+        const match = all.find((p) => p.name === sub);
+        if (match) {
+          showTrail(ctx, match.name);
+          return;
+        }
+        // Not an existing panel — treat as shell command in "shell" panel
         amuxFireAndForget("shell", sub);
         showTrail(ctx, "shell");
         return;
