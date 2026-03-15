@@ -219,52 +219,64 @@ function renderTrailWidget(ctx: ExtensionContext): void {
   const activeName = trailPanel;
 
   ctx.ui.setWidget("amux-trail", (_tui, theme) => {
-    const all = discoverAllPanels();
-    const cwd = normalizePath(process.cwd());
+    let cachedLines: string[] | undefined;
+    let cachedWidth: number | undefined;
 
-    // Tab bar
-    const tabs = all.map((p, i) => {
-      const n = i + 1;
-      const key = n <= 9 ? theme.fg("muted", `⌥${n}`) : "";
-      const isLocal = p.cwd && normalizePath(p.cwd) === cwd;
-      const suffix = isLocal ? "" : theme.fg("dim", "○");
-      if (p.name === activeName) {
-        return key + theme.fg("accent", theme.bold(":" + p.name)) + suffix;
+    function build(width: number): string[] {
+      const all = discoverAllPanels();
+      const cwd = normalizePath(process.cwd());
+
+      // Tab bar
+      const tabs = all.map((p, i) => {
+        const n = i + 1;
+        const key = n <= 9 ? theme.fg("muted", `⌥${n}`) : "";
+        const isLocal = p.cwd && normalizePath(p.cwd) === cwd;
+        const suffix = isLocal ? "" : theme.fg("dim", "○");
+        if (p.name === activeName) {
+          return key + theme.fg("accent", theme.bold(":" + p.name)) + suffix;
+        }
+        return key + theme.fg("dim", ":" + p.name) + suffix;
+      });
+      const tabLine = truncateToWidth(" " + tabs.join("  "), width);
+
+      // Panel output — last TRAIL_LINES lines
+      let outputLines: string[] = [];
+      const result = amux([activeName, "read"]);
+      const raw = result.stdout.trim();
+      if (raw && raw !== "(empty)") {
+        const lines = raw.split("\n");
+        outputLines = lines.slice(-TRAIL_LINES);
       }
-      return key + theme.fg("dim", ":" + p.name) + suffix;
-    });
-    const tabLine = " " + tabs.join("  ");
 
-    // Panel output — last TRAIL_LINES lines
-    let outputLines: string[] = [];
-    const result = amux([activeName, "read"]);
-    const raw = result.stdout.trim();
-    if (raw && raw !== "(empty)") {
-      const lines = raw.split("\n");
-      outputLines = lines.slice(-TRAIL_LINES);
+      const contentLines = outputLines.map((l) =>
+        truncateToWidth(" " + theme.fg("toolOutput", l), width)
+      );
+
+      // Pad to TRAIL_LINES so widget doesn't jump in height
+      while (contentLines.length < TRAIL_LINES) {
+        contentLines.push("");
+      }
+
+      const divider = theme.fg("dim", "─".repeat(width));
+
+      return [
+        tabLine,
+        divider,
+        ...contentLines,
+        divider,
+      ];
     }
-
-    const contentLines = outputLines.map((l) =>
-      " " + theme.fg("toolOutput", l)
-    );
-
-    // Pad to TRAIL_LINES so widget doesn't jump in height
-    while (contentLines.length < TRAIL_LINES) {
-      contentLines.push("");
-    }
-
-    const divider = theme.fg("dim", "─".repeat(80));
-
-    const widgetLines = [
-      tabLine,
-      divider,
-      ...contentLines,
-      divider,
-    ];
 
     return {
-      render: () => widgetLines,
-      invalidate: () => {},
+      render(width: number): string[] {
+        cachedLines = build(width);
+        cachedWidth = width;
+        return cachedLines;
+      },
+      invalidate() {
+        cachedLines = undefined;
+        cachedWidth = undefined;
+      },
     };
   });
 }
@@ -397,9 +409,8 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       const name = args.name || "…";
       const cmd = args.command || "…";
-      const t = args.timeout ? theme.fg("muted", ` -t${args.timeout}`) : "";
       return new Text(
-        theme.fg("toolTitle", theme.bold("▶ " + name)) + theme.fg("dim", " $ ") + theme.fg("toolOutput", cmd) + t,
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · $ ") + theme.fg("toolOutput", cmd),
         0, 0,
       );
     },
@@ -443,8 +454,11 @@ export default function (pi: ExtensionAPI) {
 
     renderCall(args, theme) {
       const name = args.name || "…";
-      const full = args.full ? theme.fg("muted", " --full") : "";
-      return new Text(theme.fg("toolTitle", theme.bold("◀ " + name)) + full, 0, 0);
+      const full = args.full ? theme.fg("dim", " --full") : "";
+      return new Text(
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · read") + full,
+        0, 0,
+      );
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
@@ -489,8 +503,10 @@ export default function (pi: ExtensionAPI) {
         }
         return theme.fg("toolOutput", k);
       }).join(theme.fg("dim", " "));
-      const t = args.timeout ? theme.fg("muted", ` -t${args.timeout}`) : "";
-      return new Text(theme.fg("toolTitle", theme.bold("⌨ " + name)) + " " + keys + t, 0, 0);
+      return new Text(
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · ⌨ ") + keys,
+        0, 0,
+      );
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
@@ -524,7 +540,10 @@ export default function (pi: ExtensionAPI) {
     }),
 
     renderCall(args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("✕ " + (args.name || "…"))), 0, 0);
+      return new Text(
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(args.name || "…")) + theme.fg("dim", " · kill"),
+        0, 0,
+      );
     },
 
     renderResult(result, { isPartial }, theme) {
@@ -556,7 +575,10 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
 
     renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("☰ panels")), 0, 0);
+      return new Text(
+        theme.fg("dim", "amux ") + theme.fg("dim", "· list"),
+        0, 0,
+      );
     },
 
     renderResult(result, { isPartial }, theme) {
