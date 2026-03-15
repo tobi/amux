@@ -1,5 +1,6 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { isolate, waitForOutput } from "./helpers.ts";
+import { describe, test, beforeEach, afterEach } from "node:test";
+import { strict as assert } from "node:assert";
+import { isolate, waitForOutput, sleepSync } from "./helpers.ts";
 import {
   config, hasSession, ensureSession, terminate, ensurePanel,
   findPanel, panels, windowMap, list, kill, read,
@@ -12,7 +13,7 @@ import { join } from "path";
 // -- helpers ------------------------------------------------------------------
 
 // Capture stdout/stderr from a sync function.
-// Patches both .write and console.log/error (which bypass .write in Bun).
+// Patches both .write and console.log/error.
 function captureIO(fn: () => void): { stdout: string; stderr: string } {
   const origOutWrite = process.stdout.write;
   const origErrWrite = process.stderr.write;
@@ -53,20 +54,20 @@ describe("session lifecycle", () => {
   afterEach(iso.teardown);
 
   test("no session initially", () => {
-    expect(hasSession()).toBe(false);
+    assert.equal(hasSession(), false);
   });
 
   test("ensureSession creates session", () => {
     ensureSession();
-    expect(hasSession()).toBe(true);
+    assert.equal(hasSession(), true);
   });
 
   test("terminate destroys session", () => {
     ensureSession();
-    expect(hasSession()).toBe(true);
+    assert.equal(hasSession(), true);
     terminate();
-    Bun.sleepSync(200);
-    expect(hasSession()).toBe(false);
+    sleepSync(200);
+    assert.equal(hasSession(), false);
   });
 });
 
@@ -79,61 +80,61 @@ describe("panel lifecycle", () => {
 
   test("panels empty initially", () => {
     ensureSession();
-    expect(Object.keys(panels())).toEqual([]);
+    assert.deepEqual(Object.keys(panels()), []);
   });
 
   test("ensurePanel creates and renames init", () => {
     const id = ensurePanel("myapp");
-    expect(id).toBeTruthy();
-    expect(findPanel("myapp")).toBeTruthy();
-    expect(findPanel(config.initPanel)).toBeUndefined();
+    assert.ok(id);
+    assert.ok(findPanel("myapp"));
+    assert.equal(findPanel(config.initPanel), undefined);
   });
 
   test("ensurePanel is quiet", () => {
     const { stderr } = captureIO(() => ensurePanel("hinted"));
-    expect(stderr).toBe("");
+    assert.equal(stderr, "");
   });
 
   test("second panel is a new window", () => {
     ensurePanel("first");
     ensurePanel("second");
     const p = panels();
-    expect(p["first"]).toBeTruthy();
-    expect(p["second"]).toBeTruthy();
-    expect(Object.keys(p).length).toBe(2);
+    assert.ok(p["first"]);
+    assert.ok(p["second"]);
+    assert.equal(Object.keys(p).length, 2);
   });
 
   test("ensurePanel is idempotent", () => {
     const id1 = ensurePanel("myapp");
     const id2 = ensurePanel("myapp");
-    expect(id1).toBe(id2);
+    assert.equal(id1, id2);
   });
 
   test("kill removes panel", () => {
     ensurePanel("ephemeral");
-    expect(findPanel("ephemeral")).toBeTruthy();
+    assert.ok(findPanel("ephemeral"));
     kill("ephemeral");
-    Bun.sleepSync(200);
-    expect(findPanel("ephemeral")).toBeUndefined();
+    sleepSync(200);
+    assert.equal(findPanel("ephemeral"), undefined);
   });
 
   test("kill nonexistent is noop", () => {
     ensureSession();
-    expect(() => kill("ghost")).not.toThrow();
+    assert.doesNotThrow(() => kill("ghost"));
   });
 
   test("list shows panels", () => {
     ensurePanel("alpha");
     ensurePanel("beta");
     const { stdout } = captureIO(() => list());
-    expect(stdout).toContain("alpha");
-    expect(stdout).toContain("beta");
+    assert.ok(stdout.includes("alpha"));
+    assert.ok(stdout.includes("beta"));
   });
 
   test("list empty", () => {
     ensureSession();
     const { stdout } = captureIO(() => list());
-    expect(stdout).toContain("no panels");
+    assert.ok(stdout.includes("no panels"));
   });
 });
 
@@ -145,33 +146,33 @@ describe("panel name validation", () => {
   afterEach(iso.teardown);
 
   test("rejects empty name", () => {
-    expect(() => ensurePanel("")).toThrow(InvalidPanelName);
+    assert.throws(() => ensurePanel(""), (e: any) => e instanceof InvalidPanelName);
   });
 
   test("rejects spaces", () => {
-    expect(() => ensurePanel("my app")).toThrow(InvalidPanelName);
+    assert.throws(() => ensurePanel("my app"), (e: any) => e instanceof InvalidPanelName);
   });
 
   test("rejects colons", () => {
-    expect(() => ensurePanel("host:port")).toThrow(InvalidPanelName);
+    assert.throws(() => ensurePanel("host:port"), (e: any) => e instanceof InvalidPanelName);
   });
 
   test("rejects dots", () => {
-    expect(() => ensurePanel("v1.2")).toThrow(InvalidPanelName);
+    assert.throws(() => ensurePanel("v1.2"), (e: any) => e instanceof InvalidPanelName);
   });
 
   test("rejects slashes", () => {
-    expect(() => ensurePanel("path/to")).toThrow(InvalidPanelName);
+    assert.throws(() => ensurePanel("path/to"), (e: any) => e instanceof InvalidPanelName);
   });
 
   test("rejects reserved init panel", () => {
-    expect(() => ensurePanel(config.initPanel)).toThrow(InvalidPanelName);
+    assert.throws(() => ensurePanel(config.initPanel), (e: any) => e instanceof InvalidPanelName);
   });
 
   test("allows alphanumeric-dash-underscore", () => {
     const id = ensurePanel("my-app_v2");
-    expect(id).toBeTruthy();
-    expect(findPanel("my-app_v2")).toBeTruthy();
+    assert.ok(id);
+    assert.ok(findPanel("my-app_v2"));
   });
 });
 
@@ -185,7 +186,7 @@ describe("shell and read", () => {
   test("shell runs command, read captures output", () => {
     shell("worker", "echo HELLO_AMUX_TEST");
     const output = waitForOutput("worker", /HELLO_AMUX_TEST/);
-    expect(output).toContain("HELLO_AMUX_TEST");
+    assert.ok(output.includes("HELLO_AMUX_TEST"));
   });
 
   test("read full scrollback", () => {
@@ -193,17 +194,17 @@ describe("shell and read", () => {
     waitForOutput("logger", /line_5/);
     const full = read("logger", { full: true });
     for (let i = 1; i <= 5; i++) {
-      expect(full).toContain(`line_${i}`);
+      assert.ok(full.includes(`line_${i}`));
     }
   });
 
   test("read nonexistent panel throws", () => {
     ensureSession();
-    expect(() => read("nonexistent")).toThrow(PanelNotFound);
+    assert.throws(() => read("nonexistent"), (e: any) => e instanceof PanelNotFound);
   });
 
   test("shell empty command throws", () => {
-    expect(() => shell("x", "")).toThrow(AmuxError);
+    assert.throws(() => shell("x", ""), (e: any) => e instanceof AmuxError);
   });
 });
 
@@ -216,19 +217,19 @@ describe("sendKeys", () => {
 
   test("literal text and Enter", () => {
     ensurePanel("repl");
-    Bun.sleepSync(500);
+    sleepSync(500);
     sendKeys("repl", ["echo KEYTEST", "Enter"]);
     const output = waitForOutput("repl", /KEYTEST/);
-    expect(output).toContain("KEYTEST");
+    assert.ok(output.includes("KEYTEST"));
   });
 
   test("Ctrl-C interrupts", () => {
     shell("sleeper", "sleep 999");
-    Bun.sleepSync(300);
+    sleepSync(300);
     sendKeys("sleeper", ["C-c"]);
-    Bun.sleepSync(500);
+    sleepSync(500);
     const output = read("sleeper");
-    expect(output).toContain("sleeper");
+    assert.ok(output.includes("sleeper"));
   });
 });
 
@@ -243,7 +244,7 @@ describe("streaming", () => {
     const { stdout } = captureIO(() => {
       shell("streamer", "echo STREAM_OK", { timeout: 3 });
     });
-    expect(stdout).toContain("STREAM_OK");
+    assert.ok(stdout.includes("STREAM_OK"));
   });
 
   test("detects ready sequence and stops early", () => {
@@ -252,7 +253,7 @@ describe("streaming", () => {
       shell("quick", "echo done", { timeout: 30 });
     });
     const elapsed = (performance.now() - start) / 1000;
-    expect(elapsed).toBeLessThan(10);
+    assert.ok(elapsed < 10);
   });
 });
 
@@ -268,12 +269,12 @@ describe("windowMap", () => {
     ensurePanel("two");
     ensurePanel("three");
     const wm = windowMap();
-    expect(wm["one"]).toBeTruthy();
-    expect(wm["two"]).toBeTruthy();
-    expect(wm["three"]).toBeTruthy();
+    assert.ok(wm["one"]);
+    assert.ok(wm["two"]);
+    assert.ok(wm["three"]);
     for (const meta of Object.values(wm)) {
-      expect(meta.id).toBeTruthy();
-      expect(typeof meta.index).toBe("number");
+      assert.ok(meta.id);
+      assert.equal(typeof meta.index, "number");
     }
   });
 });
@@ -290,8 +291,8 @@ describe("saveTimeoutLog", () => {
     const files = readdirSync(config.logDir).filter((f) =>
       f.startsWith("test-panel-stream-")
     );
-    expect(files.length).toBe(1);
-    expect(readFileSync(join(config.logDir, files[0]), "utf-8")).toBe(
+    assert.equal(files.length, 1);
+    assert.equal(readFileSync(join(config.logDir, files[0]), "utf-8"),
       "raw data here"
     );
   });

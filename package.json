@@ -23,9 +23,9 @@
     "skills"
   ],
   "scripts": {
-    "test": "bun test",
-    "test:unit": "bun test test/unit.test.ts",
-    "test:integration": "bun test test/integration.test.ts"
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
+    "test:unit": "node --experimental-strip-types --no-warnings --test test/unit.test.ts",
+    "test:integration": "node --experimental-strip-types --no-warnings --test test/integration.test.ts"
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0"

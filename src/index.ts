@@ -32,6 +32,9 @@ export {
   validatePanelName,
   stripAnsi,
 
+  // Panel logs
+  panelLogPath,
+
   // Low-level
   tmux,
   socketPath,

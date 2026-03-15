@@ -1,69 +1,28 @@
 /**
  * amux — pi extension
  *
- * Gives the agent amux tools for running background tasks in named tmux panels.
- * Shows active panel status in the pi status bar.
- * Custom tool rendering for neat display of panel commands and output.
+ * Tools for running background tasks in named tmux panels.
+ * Status bar shows active panels with pulsing on live output.
+ * ⌥1..9 opens panel viewer overlay.
+ * Activity detection via fs.watch on ~/.amux/panels/*.log.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Text, Container, matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readdirSync, statSync, watch as fsWatch, mkdirSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import type { FSWatcher } from "node:fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const PANEL_DIR = join(homedir(), ".amux", "panels");
+const HOT_MS = 5000;
 
-// -- activity tracking --------------------------------------------------------
-
-const CACHE_DIR = join(homedir(), ".amux", "cache");
-const ACTIVITY_FILE = join(CACHE_DIR, "panel-activity.json");
-const ACTIVE_WINDOW_MS = 3 * 60 * 1000; // 3 minutes
-
-interface PanelActivity {
-  [name: string]: number; // panel name → last activity timestamp (ms)
-}
-
-function loadActivity(): PanelActivity {
-  try {
-    if (existsSync(ACTIVITY_FILE)) {
-      return JSON.parse(readFileSync(ACTIVITY_FILE, "utf-8"));
-    }
-  } catch {}
-  return {};
-}
-
-function saveActivity(activity: PanelActivity): void {
-  mkdirSync(CACHE_DIR, { recursive: true });
-  writeFileSync(ACTIVITY_FILE, JSON.stringify(activity));
-}
-
-function touchPanel(name: string): void {
-  const activity = loadActivity();
-  activity[name] = Date.now();
-  saveActivity(activity);
-}
-
-function removePanel(name: string): void {
-  const activity = loadActivity();
-  delete activity[name];
-  saveActivity(activity);
-}
-
-function activePanels(): string[] {
-  const activity = loadActivity();
-  const cutoff = Date.now() - ACTIVE_WINDOW_MS;
-  return Object.entries(activity)
-    .filter(([, ts]) => ts > cutoff)
-    .sort((a, b) => b[1] - a[1])
-    .map(([name]) => name);
-}
-
-// -- amux helpers (shell out to the amux CLI) ---------------------------------
+// -- amux CLI helper ----------------------------------------------------------
 
 function amuxBin(): string {
   return join(__dirname, "..", "bin", "amux");
@@ -81,23 +40,189 @@ function amux(args: string[], timeout = 10): { stdout: string; exitCode: number 
   };
 }
 
+// -- panel discovery from filesystem ------------------------------------------
+
+interface PanelState {
+  name: string;
+  hot: boolean;
+}
+
+function discoverPanels(): PanelState[] {
+  try {
+    const files = readdirSync(PANEL_DIR);
+    const now = Date.now();
+    const panels: PanelState[] = [];
+    for (const f of files) {
+      if (!f.endsWith(".log")) continue;
+      const name = basename(f, ".log");
+      try {
+        const st = statSync(join(PANEL_DIR, f));
+        panels.push({ name, hot: (now - st.mtimeMs) < HOT_MS });
+      } catch {
+        panels.push({ name, hot: false });
+      }
+    }
+    return panels.sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
+// -- status bar ---------------------------------------------------------------
+
+let lastCtx: ExtensionContext | null = null;
+let dirWatcher: FSWatcher | null = null;
+let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+
+function updateStatus(): void {
+  const ctx = lastCtx;
+  if (!ctx?.hasUI) return;
+
+  const theme = ctx.ui.theme;
+  const panels = discoverPanels();
+
+  if (panels.length === 0) {
+    ctx.ui.setStatus("amux", undefined);
+    return;
+  }
+
+  const parts: string[] = [];
+  panels.forEach((p, i) => {
+    const n = i + 1;
+    const tag = n <= 9 ? `⌥${n}:` : "";
+    if (p.hot) {
+      parts.push(theme.fg("muted", tag) + theme.bold(theme.fg("success", p.name)));
+    } else {
+      parts.push(theme.fg("muted", tag) + theme.fg("dim", p.name));
+    }
+  });
+
+  ctx.ui.setStatus("amux", theme.fg("muted", "amux ") + parts.join(theme.fg("muted", " ")));
+}
+
+function scheduleUpdate(): void {
+  if (cooldownTimer) return;
+  updateStatus();
+  cooldownTimer = setTimeout(() => { cooldownTimer = null; updateStatus(); }, 500);
+}
+
+function startWatching(ctx: ExtensionContext): void {
+  lastCtx = ctx;
+  stopWatching();
+  mkdirSync(PANEL_DIR, { recursive: true });
+  updateStatus();
+  try {
+    dirWatcher = fsWatch(PANEL_DIR, (_ev, f) => {
+      if (f && f.endsWith(".log")) scheduleUpdate();
+    });
+    dirWatcher.on("error", () => {});
+  } catch {}
+}
+
+function stopWatching(): void {
+  if (dirWatcher) { dirWatcher.close(); dirWatcher = null; }
+  if (cooldownTimer) { clearTimeout(cooldownTimer); cooldownTimer = null; }
+}
+
+// -- panel viewer overlay -----------------------------------------------------
+
+function showPanelViewer(ctx: ExtensionContext, panelIndex: number): void {
+  if (!ctx.hasUI) return;
+  const panels = discoverPanels();
+  if (panels.length === 0) { ctx.ui.notify("No amux panels", "info"); return; }
+
+  const startIdx = Math.min(panelIndex, panels.length - 1);
+
+  ctx.ui.custom<void>((tui, theme, _kb, done) => {
+    let selectedIdx = startIdx;
+    let content = "";
+    let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+    function loadContent(): void {
+      const cur = discoverPanels();
+      if (cur.length === 0) { done(); return; }
+      if (selectedIdx >= cur.length) selectedIdx = cur.length - 1;
+      const result = amux([cur[selectedIdx].name, "read"]);
+      content = result.stdout.trim() || "(empty)";
+    }
+
+    function startRefresh(): void {
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = setInterval(() => { loadContent(); tui.requestRender(); }, 2000);
+    }
+
+    loadContent();
+    startRefresh();
+
+    return {
+      render(width: number): string[] {
+        const cur = discoverPanels();
+        if (cur.length === 0) return ["(no panels)"];
+
+        const lines: string[] = [];
+
+        // Tab bar: ⌥1:server  ⌥2:build  ⌥3:test
+        const tabs = cur.map((p, i) => {
+          const key = theme.fg("muted", `⌥${i + 1}`);
+          if (i === selectedIdx) {
+            return key + theme.fg("accent", theme.bold(":" + p.name));
+          }
+          return key + theme.fg("dim", ":" + p.name);
+        });
+        lines.push(" " + tabs.join("  "));
+        lines.push(theme.fg("dim", "─".repeat(width)));
+
+        // Panel output
+        const contentLines = content.split("\n");
+        const maxLines = Math.max(1, (tui.screenHeight || 24) - 6);
+        const visible = contentLines.slice(-maxLines);
+        for (const line of visible) {
+          lines.push(" " + truncateToWidth(theme.fg("toolOutput", line), width - 2));
+        }
+
+        // Footer
+        lines.push(theme.fg("dim", "─".repeat(width)));
+        lines.push(" " + theme.fg("dim", "⌥1-9 switch · esc close · refreshes every 2s"));
+
+        return lines;
+      },
+
+      invalidate(): void {},
+
+      handleInput(data: string): void {
+        if (matchesKey(data, Key.escape)) {
+          if (refreshTimer) clearInterval(refreshTimer);
+          done();
+          return;
+        }
+        for (let i = 1; i <= 9; i++) {
+          if (matchesKey(data, Key.alt(String(i) as any))) {
+            const cur = discoverPanels();
+            if (i - 1 < cur.length) {
+              selectedIdx = i - 1;
+              loadContent();
+              startRefresh();
+              tui.requestRender();
+            }
+            return;
+          }
+        }
+      },
+    };
+  });
+}
+
 // -- rendering helpers --------------------------------------------------------
 
 const PREVIEW_LINES = 5;
 
-function renderOutput(
-  output: string,
-  expanded: boolean,
-  theme: any,
-): string {
+function renderOutput(output: string, expanded: boolean, theme: any): string {
   const trimmed = output.trim();
   if (!trimmed) return "";
-
   const lines = trimmed.split("\n");
   const maxLines = expanded ? lines.length : PREVIEW_LINES;
   const display = lines.slice(0, maxLines);
   const remaining = lines.length - maxLines;
-
   let text = display.map((l) => theme.fg("toolOutput", l)).join("\n");
   if (remaining > 0) {
     text += "\n" + theme.fg("muted", `… ${remaining} more lines, `) + keyHint("expandTools", "to expand");
@@ -105,39 +230,32 @@ function renderOutput(
   return text;
 }
 
-// -- status bar ---------------------------------------------------------------
-
-function updateStatus(ctx: ExtensionContext): void {
-  if (!ctx.hasUI) return;
-  const theme = ctx.ui.theme;
-  const names = activePanels();
-
-  if (names.length === 0) {
-    ctx.ui.setStatus("amux", undefined);
-    return;
-  }
-
-  const label = theme.fg("dim", "amux ");
-  const panelList = names.map((n) => theme.fg("accent", n)).join(theme.fg("dim", " · "));
-  ctx.ui.setStatus("amux", label + panelList);
+function getTextContent(result: any): string {
+  return (result.content || [])
+    .filter((c: any) => c.type === "text")
+    .map((c: any) => c.text || "")
+    .join("\n");
 }
 
 // -- extension ----------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // --- status bar on session events ---
 
-  pi.on("session_start", (_event, ctx) => {
-    updateStatus(ctx);
-  });
+  // --- lifecycle ---
 
-  pi.on("session_switch", (_event, ctx) => {
-    updateStatus(ctx);
-  });
+  pi.on("session_start", (_event, ctx) => startWatching(ctx));
+  pi.on("session_switch", (_event, ctx) => startWatching(ctx));
+  pi.on("session_shutdown", () => stopWatching());
+  pi.on("turn_end", (_event, ctx) => { lastCtx = ctx; updateStatus(); });
 
-  pi.on("turn_end", (_event, ctx) => {
-    updateStatus(ctx);
-  });
+  // --- ⌥1..9 panel viewer ---
+
+  for (let i = 1; i <= 9; i++) {
+    pi.registerShortcut(Key.alt(String(i) as any), {
+      description: `View amux panel ${i}`,
+      handler: async (ctx) => showPanelViewer(ctx, i - 1),
+    });
+  }
 
   // --- tool: amux_shell ---
 
@@ -169,16 +287,9 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) {
-        return new Text(theme.fg("muted", "⠿ running…"), 0, 0);
-      }
-      const output = (result.content || [])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text || "")
-        .join("\n");
-      if (result.isError) {
-        return new Text(theme.fg("error", output || "error"), 0, 0);
-      }
+      if (isPartial) return new Text(theme.fg("muted", "⠿ running…"), 0, 0);
+      const output = getTextContent(result);
+      if (result.isError) return new Text(theme.fg("error", output || "error"), 0, 0);
       const rendered = renderOutput(output, expanded, theme);
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
@@ -187,7 +298,6 @@ export default function (pi: ExtensionAPI) {
       const { name, command, timeout } = params;
       const t = timeout ?? 5;
       const result = amux([name, "shell", command, `-t${t}`], t + 5);
-      touchPanel(name);
       return {
         content: [{ type: "text", text: result.stdout || "(no output)" }],
         details: { panel: name, command, exitCode: result.exitCode },
@@ -210,23 +320,13 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       const name = args.name || "…";
       const full = args.full ? theme.fg("muted", " --full") : "";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("◀ " + name)) + full,
-        0, 0,
-      );
+      return new Text(theme.fg("toolTitle", theme.bold("◀ " + name)) + full, 0, 0);
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) {
-        return new Text(theme.fg("muted", "⠿ reading…"), 0, 0);
-      }
-      const output = (result.content || [])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text || "")
-        .join("\n");
-      if (result.isError) {
-        return new Text(theme.fg("error", output || "error"), 0, 0);
-      }
+      if (isPartial) return new Text(theme.fg("muted", "⠿ reading…"), 0, 0);
+      const output = getTextContent(result);
+      if (result.isError) return new Text(theme.fg("error", output || "error"), 0, 0);
       const rendered = renderOutput(output, expanded, theme);
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
@@ -235,7 +335,6 @@ export default function (pi: ExtensionAPI) {
       const args = [params.name, "read"];
       if (params.full) args.push("--full");
       const result = amux(args);
-      touchPanel(params.name);
       return {
         content: [{ type: "text", text: result.stdout || "(empty)" }],
         details: { panel: params.name, full: !!params.full },
@@ -261,30 +360,19 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       const name = args.name || "…";
       const keys = (args.keys || []).map((k: string) => {
-        // Style special keys differently from literal text
         if (/^C-.|^Enter$|^Tab$|^Esc$|^Space$|^BSpace$|^Up$|^Down$|^Left$|^Right$/.test(k)) {
           return theme.fg("warning", k);
         }
         return theme.fg("toolOutput", k);
       }).join(theme.fg("dim", " "));
       const t = args.timeout ? theme.fg("muted", ` -t${args.timeout}`) : "";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("⌨ " + name)) + " " + keys + t,
-        0, 0,
-      );
+      return new Text(theme.fg("toolTitle", theme.bold("⌨ " + name)) + " " + keys + t, 0, 0);
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) {
-        return new Text(theme.fg("muted", "⠿ sending…"), 0, 0);
-      }
-      const output = (result.content || [])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text || "")
-        .join("\n");
-      if (result.isError) {
-        return new Text(theme.fg("error", output || "error"), 0, 0);
-      }
+      if (isPartial) return new Text(theme.fg("muted", "⠿ sending…"), 0, 0);
+      const output = getTextContent(result);
+      if (result.isError) return new Text(theme.fg("error", output || "error"), 0, 0);
       const rendered = renderOutput(output, expanded, theme);
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
@@ -293,7 +381,6 @@ export default function (pi: ExtensionAPI) {
       const { name, keys, timeout } = params;
       const t = timeout ?? 5;
       const result = amux([name, "send-keys", ...keys, `-t${t}`], t + 5);
-      touchPanel(name);
       return {
         content: [{ type: "text", text: result.stdout || "(no output)" }],
         details: { panel: name, keys },
@@ -313,26 +400,18 @@ export default function (pi: ExtensionAPI) {
     }),
 
     renderCall(args, theme) {
-      const name = args.name || "…";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("✕ " + name)),
-        0, 0,
-      );
+      return new Text(theme.fg("toolTitle", theme.bold("✕ " + (args.name || "…"))), 0, 0);
     },
 
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return undefined;
       const name = result.details?.panel || "panel";
-      if (result.isError) {
-        const output = (result.content || []).map((c: any) => c.text || "").join("\n");
-        return new Text(theme.fg("error", output || "error"), 0, 0);
-      }
+      if (result.isError) return new Text(theme.fg("error", getTextContent(result) || "error"), 0, 0);
       return new Text(theme.fg("success", "✓") + theme.fg("dim", ` ${name} removed`), 0, 0);
     },
 
     async execute(_toolCallId, params) {
       const result = amux([params.name, "kill"]);
-      removePanel(params.name);
       return {
         content: [{ type: "text", text: result.stdout || `killed ${params.name}` }],
         details: { panel: params.name },
@@ -350,33 +429,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
 
     renderCall(_args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("☰ panels")),
-        0, 0,
-      );
+      return new Text(theme.fg("toolTitle", theme.bold("☰ panels")), 0, 0);
     },
 
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return undefined;
-      const output = (result.content || [])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text || "")
-        .join("\n")
-        .trim();
-      if (result.isError) {
-        return new Text(theme.fg("error", output || "error"), 0, 0);
-      }
-      if (!output || output === "no panels") {
-        return new Text(theme.fg("dim", "no panels"), 0, 0);
-      }
-      // Format panel list nicely
+      const output = getTextContent(result).trim();
+      if (result.isError) return new Text(theme.fg("error", output || "error"), 0, 0);
+      if (!output || output === "no panels") return new Text(theme.fg("dim", "no panels"), 0, 0);
       const lines = output.split("\n").map((line) => {
         const parts = line.trim().split(/\t+/);
-        if (parts.length >= 2) {
-          const idx = parts[0];
-          const name = parts[1];
-          return theme.fg("muted", idx + " ") + theme.fg("accent", name);
-        }
+        if (parts.length >= 2) return theme.fg("muted", parts[0] + " ") + theme.fg("accent", parts[1]);
         return theme.fg("toolOutput", line);
       });
       return new Text(lines.join("\n"), 0, 0);
@@ -394,16 +457,11 @@ export default function (pi: ExtensionAPI) {
   // --- command: /amux ---
 
   pi.registerCommand("amux", {
-    description: "Show amux panel status or run `amux watch` to attach",
-    handler: async (args, ctx) => {
-      if (args?.trim() === "watch") {
-        ctx.ui.notify("Run `amux watch` in a separate terminal to see panels live", "info");
-        return;
-      }
-      const result = amux(["list"]);
-      const active = activePanels();
-      if (active.length > 0) {
-        ctx.ui.notify(`Active panels: ${active.join(", ")}`, "info");
+    description: "Show amux panel status",
+    handler: async (_args, ctx) => {
+      const panels = discoverPanels();
+      if (panels.length > 0) {
+        ctx.ui.notify(`Active panels: ${panels.map((p) => p.name).join(", ")}`, "info");
       } else {
         ctx.ui.notify("No active amux panels", "info");
       }

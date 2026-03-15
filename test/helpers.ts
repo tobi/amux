@@ -4,7 +4,17 @@
 
 import { mkdtempSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
+import { spawnSync } from "child_process";
 import { config, serverRunning, hasSession, read } from "../src/amux.ts";
+
+// -- synchronous sleep (node-compatible) --------------------------------------
+
+const sleepBuffer = new SharedArrayBuffer(4);
+const sleepArray = new Int32Array(sleepBuffer);
+
+export function sleepSync(ms: number): void {
+  Atomics.wait(sleepArray, 0, 0, ms);
+}
 
 export interface SavedConfig {
   sessionName: string;
@@ -40,15 +50,15 @@ export function isolate(suiteName: string): {
     teardown() {
       // Kill the test tmux server entirely
       if (serverRunning()) {
-        Bun.spawnSync(
-          ["tmux", "-L", config.socketName, "kill-server"],
-          { stdout: "ignore", stderr: "ignore" }
+        spawnSync(
+          "tmux", ["-L", config.socketName, "kill-server"],
+          { stdio: ["ignore", "ignore", "ignore"] }
         );
         // Wait for socket to disappear
         for (let i = 0; i < 10; i++) {
           const sp = socketPathFor(config.socketName);
           if (!existsSync(sp)) break;
-          Bun.sleepSync(100);
+          sleepSync(100);
         }
       }
 
@@ -89,6 +99,6 @@ export function waitForOutput(
         `timed out waiting for ${pattern} in panel '${panelName}'`
       );
     }
-    Bun.sleepSync(150);
+    sleepSync(150);
   }
 }

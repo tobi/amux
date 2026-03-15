@@ -4,10 +4,13 @@
 // Each panel name maps to a deterministic tmux window name.
 // A dedicated tmux config locks down titles and provides tab switching hotkeys.
 
-import { Terminal } from "@xterm/headless";
-import { existsSync, mkdirSync, mkdtempSync, statSync, rmSync, openSync, readSync, closeSync } from "fs";
-import { homedir, tmpdir } from "os";
-import { join, resolve } from "path";
+import pkg from "@xterm/headless";
+const { Terminal } = pkg;
+import { existsSync, mkdirSync, statSync, rmSync, openSync, readSync, closeSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join, resolve, dirname } from "path";
+import { spawnSync, execFileSync } from "child_process";
+import { fileURLToPath } from "url";
 
 // -- errors -------------------------------------------------------------------
 
@@ -71,7 +74,9 @@ export const INTERACTIVE_PROMPT_RE = new RegExp(
 
 // -- configuration (overridable for testing) ----------------------------------
 
-const ROOT = resolve(import.meta.dir, "..");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const ROOT = resolve(__dirname, "..");
 
 export const config = {
   sessionName: "amux",
@@ -80,6 +85,7 @@ export const config = {
   tmuxConf: join(ROOT, "conf", "amux", "tmux.conf"),
   bashRc: join(ROOT, "conf", "amux", "bashrc"),
   logDir: join(homedir(), ".amux", "logs"),
+  panelDir: join(homedir(), ".amux", "panels"),
 };
 
 function shellCmd(): string {
@@ -92,6 +98,15 @@ function shellEscape(s: string): string {
   if (s === "") return "''";
   if (/^[a-zA-Z0-9_./-]+$/.test(s)) return s;
   return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// -- synchronous sleep (node-compatible) --------------------------------------
+
+const sleepBuffer = new SharedArrayBuffer(4);
+const sleepArray = new Int32Array(sleepBuffer);
+
+function sleepSync(ms: number): void {
+  Atomics.wait(sleepArray, 0, 0, ms);
 }
 
 // -- terminal screen reader ---------------------------------------------------
@@ -195,30 +210,31 @@ export function serverRunning(): boolean {
 
 export function tmux(args: string[], opts?: { allowFail?: boolean }): string {
   const cmd = tmuxBase();
-  const result = Bun.spawnSync([...cmd, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
+  const all = [...cmd, ...args];
+  const result = spawnSync(all[0], all.slice(1), {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
   });
-  const out = result.stdout.toString() + result.stderr.toString();
-  if (result.exitCode === 0 || opts?.allowFail) return out;
+  const out = (result.stdout ?? "") + (result.stderr ?? "");
+  if (result.status === 0 || opts?.allowFail) return out;
   throw new TmuxError(`tmux ${args[0]}: ${out.trim()}`);
 }
 
 function reloadConfig(): void {
   if (!serverRunning()) return;
-  Bun.spawnSync([...tmuxBase(), "source-file", config.tmuxConf], {
-    stdout: "ignore",
-    stderr: "ignore",
+  const all = [...tmuxBase(), "source-file", config.tmuxConf];
+  spawnSync(all[0], all.slice(1), {
+    stdio: ["ignore", "ignore", "ignore"],
   });
 }
 
 export function hasSession(): boolean {
   if (!serverRunning()) return false;
-  const result = Bun.spawnSync(
-    [...tmuxBase(), "has-session", "-t", config.sessionName],
-    { stdout: "ignore", stderr: "ignore" }
-  );
-  return result.exitCode === 0;
+  const all = [...tmuxBase(), "has-session", "-t", config.sessionName];
+  const result = spawnSync(all[0], all.slice(1), {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return result.status === 0;
 }
 
 export function ensureSession(): void {
@@ -281,6 +297,25 @@ function resolvePanel(name: string): string {
   return id;
 }
 
+// -- panel log files ----------------------------------------------------------
+
+/** Path to the persistent output log for a panel. */
+export function panelLogPath(name: string): string {
+  return join(config.panelDir, `${name}.log`);
+}
+
+/** Start persistent pipe-pane logging for a panel. */
+function startPanelLog(target: string, name: string): void {
+  mkdirSync(config.panelDir, { recursive: true });
+  const logPath = panelLogPath(name);
+  // Truncate on panel creation — fresh log per panel lifecycle
+  writeFileSync(logPath, "");
+  tmux([
+    "pipe-pane", "-o", "-t", target,
+    `cat >> ${shellEscape(logPath)}`,
+  ]);
+}
+
 // -- lazy panel creation ------------------------------------------------------
 
 export function ensurePanel(name: string): string {
@@ -306,7 +341,7 @@ export function ensurePanel(name: string): string {
       `export AMUX_PANEL=${shellEscape(name)}; clear`,
     ]);
     tmux(["send-keys", "-t", init.id, "Enter"]);
-    Bun.sleepSync(500);
+    sleepSync(500);
     id = init.id;
   } else {
     const out = tmux([
@@ -321,6 +356,7 @@ export function ensurePanel(name: string): string {
     id = out.trim();
   }
 
+  startPanelLog(id, name);
   return id;
 }
 
@@ -345,7 +381,7 @@ export function saveTimeoutLog(
     String(now.getSeconds()).padStart(2, "0");
   const seq = ++logSeq;
   const path = join(config.logDir, `${panelName}-${context}-${ts}-${seq}.raw`);
-  Bun.write(path, rawBytes);
+  writeFileSync(path, rawBytes);
   process.stderr.write(`amux: raw output saved to ${path}\n`);
   process.stderr.write(`amux: inspect with: xxd ${path} | less\n`);
   return path;
@@ -355,7 +391,11 @@ function monotonic(): number {
   return performance.now() / 1000;
 }
 
-/** Returns true if the stream timed out (panel still producing output). */
+/**
+ * Tails the persistent panel log file while fn() runs.
+ * The log is written by the pipe-pane set up in ensurePanel.
+ * Returns true if the stream timed out (panel still producing output).
+ */
 function streamFor(
   target: string,
   fn: () => void,
@@ -366,24 +406,19 @@ function streamFor(
     return false;
   }
 
-  const dir = mkdtempSync(join(tmpdir(), "amux-stream-"));
-  const outPath = join(dir, "output");
-  Bun.write(outPath, "");
-  let allData = Buffer.alloc(0);
-  let piping = false;
+  const name = panelName || "unknown";
+  const logPath = panelLogPath(name);
+
+  // Record current log size so we only read new output
+  let pos = 0;
+  try { pos = statSync(logPath).size; } catch {}
 
   // Virtual terminal for clean screen reading
   const screen = createScreen();
+  let allData = Buffer.alloc(0);
 
   const cleanup = () => {
-    if (piping) {
-      tmux(["pipe-pane", "-t", target], { allowFail: true });
-      piping = false;
-    }
     screen.dispose();
-    try {
-      rmSync(dir, { recursive: true, force: true });
-    } catch {}
   };
 
   const sigHandler = () => {
@@ -395,21 +430,13 @@ function streamFor(
   process.on("SIGTERM", sigHandler);
 
   try {
-    tmux([
-      "pipe-pane", "-o", "-t", target,
-      `cat >> ${shellEscape(outPath)}`,
-    ]);
-    piping = true;
-
     fn();
 
-    let pos = 0;
     let deadline = monotonic() + timeout;
     let timedOut = true;
-    // Track how many clean lines we've already emitted so we only send new ones
     let emittedLines = 0;
 
-    const fd = openSync(outPath, "r");
+    const fd = openSync(logPath, "r");
     const buf = Buffer.alloc(65536);
     try {
       while (true) {
@@ -417,11 +444,7 @@ function streamFor(
         if (t >= deadline) break;
 
         let size: number;
-        try {
-          size = statSync(outPath).size;
-        } catch {
-          size = 0;
-        }
+        try { size = statSync(logPath).size; } catch { size = 0; }
 
         if (size > pos) {
           const toRead = Math.min(size - pos, buf.length);
@@ -437,8 +460,6 @@ function streamFor(
             // Read clean screen text and emit only new lines
             const lines = screen.screenLines();
             if (lines.length > emittedLines) {
-              // Emit all complete lines we haven't sent yet
-              // (skip the last line — it may still be receiving data)
               const completeEnd = Math.max(emittedLines, lines.length - 1);
               for (let i = emittedLines; i < completeEnd; i++) {
                 process.stdout.write(lines[i] + "\n");
@@ -447,28 +468,23 @@ function streamFor(
             }
 
             // Check if the panel is waiting for input
-            const waiting = detectInputWait(
-              screen.cursorLine(),
-              panelName || "unknown"
-            );
-
+            const waiting = detectInputWait(screen.cursorLine(), name);
             if (waiting) {
               timedOut = false;
-              // Give a brief window for any remaining output to flush
               const grace = waiting === "prompt" ? 0.2 : 0.3;
               const cap = monotonic() + grace;
               if (cap < deadline) deadline = cap;
             }
           }
         } else {
-          Bun.sleepSync(50);
+          sleepSync(50);
         }
       }
     } finally {
       closeSync(fd);
     }
 
-    // Flush any remaining lines (including the final cursor line)
+    // Flush remaining lines
     const finalLines = screen.screenLines();
     for (let i = emittedLines; i < finalLines.length; i++) {
       const line = finalLines[i];
@@ -476,7 +492,7 @@ function streamFor(
     }
 
     if (timedOut && allData.length > 0) {
-      saveTimeoutLog(allData, panelName || "unknown", "stream");
+      saveTimeoutLog(allData, name, "stream");
     }
 
     cleanup();
@@ -556,10 +572,14 @@ export function kill(name: string): void {
   const target = findPanel(name);
   if (!target) return;
   tmux(["kill-window", "-t", target], { allowFail: true });
+  // Clean up panel log
+  try { rmSync(panelLogPath(name), { force: true }); } catch {}
 }
 
 export function terminate(): void {
   tmux(["kill-session", "-t", config.sessionName], { allowFail: true });
+  // Clean up all panel logs
+  try { rmSync(config.panelDir, { recursive: true, force: true }); } catch {}
 }
 
 export function watch(opts?: { readonly?: boolean }): never {
@@ -569,8 +589,12 @@ export function watch(opts?: { readonly?: boolean }): never {
   selectBestWindow();
   const args = [...tmuxBase(), "attach-session", "-t", config.sessionName];
   if (ro) args.push("-r");
-  const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
-  process.exit(proc.exitCode);
+  try {
+    execFileSync(args[0], args.slice(1), { stdio: "inherit" });
+    process.exit(0);
+  } catch (e: any) {
+    process.exit(e.status ?? 1);
+  }
 }
 
 function selectBestWindow(): void {
