@@ -12,7 +12,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Text, Container, matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { readdirSync, readFileSync, statSync, watch as fsWatch, mkdirSync, symlinkSync, unlinkSync, existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, watch as fsWatch, mkdirSync, symlinkSync, unlinkSync, existsSync, lstatSync, readlinkSync, realpathSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -22,8 +22,28 @@ import type { FSWatcher } from "node:fs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PANEL_DIR = join(homedir(), ".amux", "panels");
 const HOT_MS = 5000;
-const TRAIL_LINES = 6;
+const TRAIL_MIN_LINES = 5;
+const TRAIL_SCREEN_FRACTION = 0.33;
 const TRAIL_REFRESH_MS = 1000;
+
+// ANSI helpers for styling
+const BLUE_FG = "\x1b[34m";
+const BLUE_BG = "\x1b[44m";
+const TEAL_FG = "\x1b[38;2;94;182;176m"; // muted teal
+const RESET = "\x1b[0m";
+const BOLD = "\x1b[1m";
+const DIM = "\x1b[2m";
+
+function blueFg(s: string): string { return `${BLUE_FG}${s}${RESET}`; }
+function blueBgWhite(s: string): string { return `\x1b[97;1;44m${s}${RESET}`; }
+function blueDim(s: string): string { return `${BLUE_FG}${DIM}${s}${RESET}`; }
+function teal(s: string): string { return `${TEAL_FG}${s}${RESET}`; }
+function tealDim(s: string): string { return `${TEAL_FG}${DIM}${s}${RESET}`; }
+
+function trailLines(): number {
+  const rows = process.stdout.rows || 24;
+  return Math.max(TRAIL_MIN_LINES, Math.floor(rows * TRAIL_SCREEN_FRACTION));
+}
 
 // -- amux CLI helper ----------------------------------------------------------
 
@@ -115,62 +135,22 @@ function scopePanels(cwd: string): ScopedPanels {
   return { local, others };
 }
 
-// -- status bar ---------------------------------------------------------------
+// -- watcher ------------------------------------------------------------------
 
 let lastCtx: ExtensionContext | null = null;
 let dirWatcher: FSWatcher | null = null;
 let cooldownTimer: ReturnType<typeof setTimeout> | null = null;
 
-function updateStatus(): void {
-  const ctx = lastCtx;
-  if (!ctx?.hasUI) return;
-
-  const theme = ctx.ui.theme;
-  const { local, others } = scopePanels(process.cwd());
-
-  if (local.length === 0 && others.length === 0) {
-    ctx.ui.setStatus("amux", undefined);
-    return;
-  }
-
-  const parts: string[] = [];
-  local.forEach((p, i) => {
-    const n = i + 1;
-    const tag = n <= 9 ? `⌥${n}:` : "";
-    if (p.hot) {
-      parts.push(theme.fg("muted", tag) + theme.bold(theme.fg("success", p.name)));
-    } else {
-      parts.push(theme.fg("muted", tag) + theme.fg("dim", p.name));
-    }
-  });
-
-  if (others.length > 0) {
-    const anyHot = others.some((p) => p.hot);
-    const label = `+${others.length} other${others.length === 1 ? "" : "s"}`;
-    if (anyHot) {
-      parts.push(theme.bold(theme.fg("success", label)));
-    } else {
-      parts.push(theme.fg("dim", label));
-    }
-  }
-
-  const status = local.length > 0
-    ? theme.fg("muted", "amux ") + parts.join(theme.fg("muted", " "))
-    : parts.join(theme.fg("muted", " "));
-  ctx.ui.setStatus("amux", status);
-}
-
 function scheduleUpdate(): void {
   if (cooldownTimer) return;
-  updateStatus();
-  cooldownTimer = setTimeout(() => { cooldownTimer = null; updateStatus(); }, 500);
+  refreshTabBar();
+  cooldownTimer = setTimeout(() => { cooldownTimer = null; refreshTabBar(); }, 500);
 }
 
 function startWatching(ctx: ExtensionContext): void {
   lastCtx = ctx;
   stopWatching();
   mkdirSync(PANEL_DIR, { recursive: true });
-  updateStatus();
   try {
     dirWatcher = fsWatch(PANEL_DIR, (_ev, f) => {
       if (f && f.endsWith(".log")) scheduleUpdate();
@@ -184,6 +164,29 @@ function stopWatching(): void {
   if (cooldownTimer) { clearTimeout(cooldownTimer); cooldownTimer = null; }
 }
 
+/** Refresh cached panel list + output, triggering widget re-render. */
+function refreshTabBar(): void {
+  trailCachedPanels = discoverAllPanels();
+  if (trailPanel) {
+    // If trailed panel no longer exists, clear it
+    if (!trailCachedPanels.some((p) => p.name === trailPanel)) {
+      trailPanel = null;
+      trailCachedOutput = [];
+    } else {
+      const maxLines = trailLines();
+      trailCachedOutput = readPanelLogTail(trailPanel, maxLines);
+    }
+  }
+  // Install/update widget if there are panels
+  if (lastCtx?.hasUI) {
+    if (trailCachedPanels.length > 0) {
+      installTabBarWidget(lastCtx);
+    } else {
+      lastCtx.ui.setWidget("amux-trail", undefined);
+    }
+  }
+}
+
 // -- trailing widget ----------------------------------------------------------
 //
 // Non-blocking inline widget above the editor showing tab headers + last N
@@ -193,16 +196,48 @@ function stopWatching(): void {
 let trailPanel: string | null = null;
 let trailRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
+// Cached data from async refresh — render() reads this, never does I/O
+let trailCachedPanels: PanelState[] = [];
+let trailCachedOutput: string[] = [];
+
+/** Read the tail of a panel's log file directly — no subprocess. */
+function readPanelLogTail(name: string, maxLines: number): string[] {
+  const logPath = join(PANEL_DIR, `${name}.log`);
+  try {
+    // Read last chunk of the log file (enough for maxLines)
+    const CHUNK = 16384;
+    const fd = openSync(logPath, "r");
+    try {
+      const st = fstatSync(fd);
+      const size = st.size;
+      if (size === 0) return [];
+      const start = Math.max(0, size - CHUNK);
+      const buf = Buffer.alloc(Math.min(CHUNK, size));
+      readSync(fd, buf, 0, buf.length, start);
+      // Strip ANSI escapes, split into lines, take tail
+      const text = buf.toString("utf-8").replace(/\x1b\[[\d;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b\(B|\r/g, "");
+      const lines = text.split("\n");
+      // Drop empty trailing line from split
+      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+      return lines.slice(-maxLines);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
 function showTrail(ctx: ExtensionContext, panelName: string): void {
   trailPanel = panelName;
+  refreshTabBar();
   startTrailRefresh(ctx);
-  renderTrailWidget(ctx);
 }
 
 function hideTrail(ctx: ExtensionContext): void {
   trailPanel = null;
-  stopTrailRefresh();
-  ctx.ui.setWidget("amux-trail", undefined);
+  trailCachedOutput = [];
+  refreshTabBar();
 }
 
 function toggleTrail(ctx: ExtensionContext, panelName: string): void {
@@ -213,62 +248,76 @@ function toggleTrail(ctx: ExtensionContext, panelName: string): void {
   }
 }
 
-function renderTrailWidget(ctx: ExtensionContext): void {
-  if (!ctx.hasUI || !trailPanel) return;
-
-  const activeName = trailPanel;
+/** Install the tab bar widget — shows tabs always, output only when trailing. */
+function installTabBarWidget(ctx: ExtensionContext): void {
+  if (!ctx.hasUI) return;
 
   ctx.ui.setWidget("amux-trail", (_tui, theme) => {
     let cachedLines: string[] | undefined;
     let cachedWidth: number | undefined;
+    let snapPanels = trailCachedPanels;
+    let snapOutput = trailCachedOutput;
+    let snapActive = trailPanel;
 
     function build(width: number): string[] {
-      const all = discoverAllPanels();
+      const activeName = trailPanel;
+      const all = trailCachedPanels;
       const cwd = normalizePath(process.cwd());
 
-      // Tab bar
+      // Tab bar — "Amux" label, tabs separated by ·, trailed tab highlighted
       const tabs = all.map((p, i) => {
         const n = i + 1;
-        const key = n <= 9 ? theme.fg("muted", `⌥${n}`) : "";
-        const isLocal = p.cwd && normalizePath(p.cwd) === cwd;
-        const suffix = isLocal ? "" : theme.fg("dim", "○");
+        const hotDot = p.hot ? blueFg("●") : "";
         if (p.name === activeName) {
-          return key + theme.fg("accent", theme.bold(":" + p.name)) + suffix;
+          // Trailed: blue bg pill
+          const label = n <= 9 ? ` ⌥${n} ${p.name} ` : ` ${p.name} `;
+          return blueBgWhite(label) + hotDot;
         }
-        return key + theme.fg("dim", ":" + p.name) + suffix;
+        const label = n <= 9 ? `⌥${n} ${p.name}` : p.name;
+        if (p.hot) {
+          return blueFg(label) + " " + hotDot;
+        }
+        return blueDim(label);
       });
-      const tabLine = truncateToWidth(" " + tabs.join("  "), width);
+      const sep = blueDim(" · ");
+      const tabLine = truncateToWidth(" " + tealDim("amux") + "  " + tabs.join(sep), width);
 
-      // Panel output — last TRAIL_LINES lines
-      let outputLines: string[] = [];
-      const result = amux([activeName, "read"]);
-      const raw = result.stdout.trim();
-      if (raw && raw !== "(empty)") {
-        const lines = raw.split("\n");
-        outputLines = lines.slice(-TRAIL_LINES);
+      // If not trailing, just show the tab bar
+      if (!activeName) {
+        return [tabLine];
       }
+
+      // Thin blue divider
+      const divider = blueDim("─".repeat(width));
+      const numLines = trailLines();
+      const outputLines = trailCachedOutput.slice(-numLines);
 
       const contentLines = outputLines.map((l) =>
         truncateToWidth(" " + theme.fg("toolOutput", l), width)
       );
 
-      // Pad to TRAIL_LINES so widget doesn't jump in height
-      while (contentLines.length < TRAIL_LINES) {
+      while (contentLines.length < numLines) {
         contentLines.push("");
       }
-
-      const divider = theme.fg("dim", "─".repeat(width));
 
       return [
         tabLine,
         divider,
         ...contentLines,
-        divider,
       ];
     }
 
     return {
       render(width: number): string[] {
+        if (snapPanels !== trailCachedPanels || snapOutput !== trailCachedOutput || snapActive !== trailPanel) {
+          cachedLines = undefined;
+          snapPanels = trailCachedPanels;
+          snapOutput = trailCachedOutput;
+          snapActive = trailPanel;
+        }
+        if (cachedLines && cachedWidth === width) {
+          return cachedLines;
+        }
         cachedLines = build(width);
         cachedWidth = width;
         return cachedLines;
@@ -284,8 +333,8 @@ function renderTrailWidget(ctx: ExtensionContext): void {
 function startTrailRefresh(ctx: ExtensionContext): void {
   stopTrailRefresh();
   trailRefreshTimer = setInterval(() => {
-    if (trailPanel && ctx.hasUI) {
-      renderTrailWidget(ctx);
+    if (ctx.hasUI) {
+      refreshTabBar();
     } else {
       stopTrailRefresh();
     }
@@ -331,6 +380,7 @@ export default function (pi: ExtensionAPI) {
   // --- lifecycle ---
 
   pi.on("session_start", (_event, ctx) => {
+    lastCtx = ctx;
     startWatching(ctx);
     if (!amuxOnPath()) {
       ctx.ui.notify(
@@ -339,18 +389,21 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    // Auto-show trailing widget if there are existing hot panels
+    // Initialize tab bar — auto-trail hot panel if any
     const existing = discoverAllPanels();
     const hot = existing.find((p) => p.hot);
     if (hot) {
       showTrail(ctx, hot.name);
     } else if (existing.length > 0) {
       showTrail(ctx, existing[0].name);
+    } else {
+      refreshTabBar();
+      startTrailRefresh(ctx);
     }
   });
-  pi.on("session_switch", (_event, ctx) => startWatching(ctx));
+  pi.on("session_switch", (_event, ctx) => { lastCtx = ctx; startWatching(ctx); });
   pi.on("session_shutdown", () => { stopWatching(); stopTrailRefresh(); });
-  pi.on("turn_end", (_event, ctx) => { lastCtx = ctx; updateStatus(); });
+  pi.on("turn_end", (_event, ctx) => { lastCtx = ctx; });
 
   // --- ⌥1..9 toggle trailing ---
 
@@ -382,7 +435,6 @@ export default function (pi: ExtensionAPI) {
       const name = trailPanel;
       amux([name, "kill"]);
       hideTrail(ctx);
-      updateStatus();
       ctx.ui.notify(`killed ${name}`, "info");
     },
   });
