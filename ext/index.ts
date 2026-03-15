@@ -3,9 +3,12 @@
  *
  * Gives the agent amux tools for running background tasks in named tmux panels.
  * Shows active panel status in the pi status bar.
+ * Custom tool rendering for neat display of panel commands and output.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { keyHint } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -78,6 +81,30 @@ function amux(args: string[], timeout = 10): { stdout: string; exitCode: number 
   };
 }
 
+// -- rendering helpers --------------------------------------------------------
+
+const PREVIEW_LINES = 5;
+
+function renderOutput(
+  output: string,
+  expanded: boolean,
+  theme: any,
+): string {
+  const trimmed = output.trim();
+  if (!trimmed) return "";
+
+  const lines = trimmed.split("\n");
+  const maxLines = expanded ? lines.length : PREVIEW_LINES;
+  const display = lines.slice(0, maxLines);
+  const remaining = lines.length - maxLines;
+
+  let text = display.map((l) => theme.fg("toolOutput", l)).join("\n");
+  if (remaining > 0) {
+    text += "\n" + theme.fg("muted", `… ${remaining} more lines, `) + keyHint("expandTools", "to expand");
+  }
+  return text;
+}
+
 // -- status bar ---------------------------------------------------------------
 
 function updateStatus(ctx: ExtensionContext): void {
@@ -130,6 +157,32 @@ export default function (pi: ExtensionAPI) {
       command: Type.String({ description: "Shell command to run" }),
       timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default: 5)" })),
     }),
+
+    renderCall(args, theme) {
+      const name = args.name || "…";
+      const cmd = args.command || "…";
+      const t = args.timeout ? theme.fg("muted", ` -t${args.timeout}`) : "";
+      return new Text(
+        theme.fg("toolTitle", theme.bold("▶ " + name)) + theme.fg("dim", " $ ") + theme.fg("toolOutput", cmd) + t,
+        0, 0,
+      );
+    },
+
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) {
+        return new Text(theme.fg("muted", "⠿ running…"), 0, 0);
+      }
+      const output = (result.content || [])
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text || "")
+        .join("\n");
+      if (result.isError) {
+        return new Text(theme.fg("error", output || "error"), 0, 0);
+      }
+      const rendered = renderOutput(output, expanded, theme);
+      return rendered ? new Text(rendered, 0, 0) : undefined;
+    },
+
     async execute(_toolCallId, params) {
       const { name, command, timeout } = params;
       const t = timeout ?? 5;
@@ -153,6 +206,31 @@ export default function (pi: ExtensionAPI) {
       name: Type.String({ description: "Panel name" }),
       full: Type.Optional(Type.Boolean({ description: "Read full scrollback instead of just the visible screen" })),
     }),
+
+    renderCall(args, theme) {
+      const name = args.name || "…";
+      const full = args.full ? theme.fg("muted", " --full") : "";
+      return new Text(
+        theme.fg("toolTitle", theme.bold("◀ " + name)) + full,
+        0, 0,
+      );
+    },
+
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) {
+        return new Text(theme.fg("muted", "⠿ reading…"), 0, 0);
+      }
+      const output = (result.content || [])
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text || "")
+        .join("\n");
+      if (result.isError) {
+        return new Text(theme.fg("error", output || "error"), 0, 0);
+      }
+      const rendered = renderOutput(output, expanded, theme);
+      return rendered ? new Text(rendered, 0, 0) : undefined;
+    },
+
     async execute(_toolCallId, params) {
       const args = [params.name, "read"];
       if (params.full) args.push("--full");
@@ -179,6 +257,38 @@ export default function (pi: ExtensionAPI) {
       }),
       timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default: 5)" })),
     }),
+
+    renderCall(args, theme) {
+      const name = args.name || "…";
+      const keys = (args.keys || []).map((k: string) => {
+        // Style special keys differently from literal text
+        if (/^C-.|^Enter$|^Tab$|^Esc$|^Space$|^BSpace$|^Up$|^Down$|^Left$|^Right$/.test(k)) {
+          return theme.fg("warning", k);
+        }
+        return theme.fg("toolOutput", k);
+      }).join(theme.fg("dim", " "));
+      const t = args.timeout ? theme.fg("muted", ` -t${args.timeout}`) : "";
+      return new Text(
+        theme.fg("toolTitle", theme.bold("⌨ " + name)) + " " + keys + t,
+        0, 0,
+      );
+    },
+
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) {
+        return new Text(theme.fg("muted", "⠿ sending…"), 0, 0);
+      }
+      const output = (result.content || [])
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text || "")
+        .join("\n");
+      if (result.isError) {
+        return new Text(theme.fg("error", output || "error"), 0, 0);
+      }
+      const rendered = renderOutput(output, expanded, theme);
+      return rendered ? new Text(rendered, 0, 0) : undefined;
+    },
+
     async execute(_toolCallId, params) {
       const { name, keys, timeout } = params;
       const t = timeout ?? 5;
@@ -201,6 +311,25 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.String({ description: "Panel name to remove" }),
     }),
+
+    renderCall(args, theme) {
+      const name = args.name || "…";
+      return new Text(
+        theme.fg("toolTitle", theme.bold("✕ " + name)),
+        0, 0,
+      );
+    },
+
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return undefined;
+      const name = result.details?.panel || "panel";
+      if (result.isError) {
+        const output = (result.content || []).map((c: any) => c.text || "").join("\n");
+        return new Text(theme.fg("error", output || "error"), 0, 0);
+      }
+      return new Text(theme.fg("success", "✓") + theme.fg("dim", ` ${name} removed`), 0, 0);
+    },
+
     async execute(_toolCallId, params) {
       const result = amux([params.name, "kill"]);
       removePanel(params.name);
@@ -219,6 +348,40 @@ export default function (pi: ExtensionAPI) {
     description: "List all active panels.",
     promptSnippet: "List all active background panels (amux list)",
     parameters: Type.Object({}),
+
+    renderCall(_args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("☰ panels")),
+        0, 0,
+      );
+    },
+
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return undefined;
+      const output = (result.content || [])
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text || "")
+        .join("\n")
+        .trim();
+      if (result.isError) {
+        return new Text(theme.fg("error", output || "error"), 0, 0);
+      }
+      if (!output || output === "no panels") {
+        return new Text(theme.fg("dim", "no panels"), 0, 0);
+      }
+      // Format panel list nicely
+      const lines = output.split("\n").map((line) => {
+        const parts = line.trim().split(/\t+/);
+        if (parts.length >= 2) {
+          const idx = parts[0];
+          const name = parts[1];
+          return theme.fg("muted", idx + " ") + theme.fg("accent", name);
+        }
+        return theme.fg("toolOutput", line);
+      });
+      return new Text(lines.join("\n"), 0, 0);
+    },
+
     async execute() {
       const result = amux(["list"]);
       return {
