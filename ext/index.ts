@@ -37,6 +37,8 @@ const DIM = "\x1b[2m";
 function blueFg(s: string): string { return `${BLUE_FG}${s}${RESET}`; }
 function blueBgBlack(s: string): string { return `\x1b[30;1;44m${s}${RESET}`; }
 function blueDim(s: string): string { return `${BLUE_FG}${DIM}${s}${RESET}`; }
+function gray(s: string): string { return `\x1b[38;5;242m${s}${RESET}`; }
+function grayDim(s: string): string { return `\x1b[38;5;239m${s}${RESET}`; }
 function teal(s: string): string { return `${TEAL_FG}${s}${RESET}`; }
 function tealDim(s: string): string { return `${TEAL_FG}${DIM}${s}${RESET}`; }
 
@@ -273,7 +275,7 @@ function installTabBarWidget(ctx: ExtensionContext): void {
           const label = n <= 9 ? ` ⌥${n} ${p.name} ` : ` ${p.name} `;
           return blueBgBlack(label) + hotDot;
         }
-        const key = n <= 9 ? blueDim(`⌥${n} `) : "";
+        const key = n <= 9 ? gray(`⌥${n} `) : "";
         const label = p.name;
         if (p.hot) {
           return key + blueFg(label) + " " + hotDot;
@@ -282,7 +284,7 @@ function installTabBarWidget(ctx: ExtensionContext): void {
       });
       const sep = blueDim(" · ");
       const left = " " + tealDim("amux") + "  " + tabs.join(sep);
-      const hint = activeName ? blueDim("⌥K kill") : "";
+      const hint = activeName ? grayDim("⌥K kill") : "";
       const leftWidth = visibleWidth(left);
       const hintWidth = visibleWidth(hint);
       const gap = Math.max(1, width - leftWidth - hintWidth - 1);
