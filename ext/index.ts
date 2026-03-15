@@ -10,7 +10,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Text, Container, matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
+import { Text, Container, matchesKey, Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { readdirSync, readFileSync, statSync, watch as fsWatch, mkdirSync, symlinkSync, unlinkSync, existsSync, lstatSync, readlinkSync, realpathSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
@@ -281,7 +281,12 @@ function installTabBarWidget(ctx: ExtensionContext): void {
         return key + blueDim(label);
       });
       const sep = blueDim(" · ");
-      const tabLine = truncateToWidth(" " + tealDim("amux") + "  " + tabs.join(sep), width);
+      const left = " " + tealDim("amux") + "  " + tabs.join(sep);
+      const hint = activeName ? blueDim("⌥K kill") : "";
+      const leftWidth = visibleWidth(left);
+      const hintWidth = visibleWidth(hint);
+      const gap = Math.max(1, width - leftWidth - hintWidth - 1);
+      const tabLine = truncateToWidth(left + " ".repeat(gap) + hint + " ", width);
 
       // If not trailing, just show the tab bar
       if (!activeName) {
