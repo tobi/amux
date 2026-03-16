@@ -1,7 +1,7 @@
 #!/usr/bin/env -S node --experimental-strip-types --no-warnings
 
 import {
-  list, watch, panels, terminate, shell, sendKeys, read, kill,
+  list, watch, panels, terminate, shell, sendKeys, tail, kill,
   AmuxError,
 } from "../src/amux.ts";
 
@@ -24,7 +24,7 @@ For humans:
 For agents:
   amux NAME shell CMD...    run command in a panel, stream output back
   amux NAME send-keys K...  send keystrokes to a panel
-  amux NAME read [--full]   capture panel buffer (--full for scrollback)
+  amux NAME tail [opts]     tail panel output (--follow, --lines=N, --timeout=N)
   amux NAME kill            remove a single panel
 
 Options:
@@ -40,7 +40,9 @@ send-keys reference:
 Examples:
   amux server shell "npm start"           start a dev server
   amux watch                              see it running
-  amux server read                        check its output
+  amux server tail                        last 10 lines of output
+  amux server tail --follow               tail -f until done or 30s
+  amux server tail --lines=50             last 50 lines
   amux server send-keys C-c               interrupt it
   amux repl shell "irb"                   start a REPL
   amux repl send-keys "puts :hi" Enter    type + enter
@@ -58,7 +60,7 @@ if (tIdx !== -1) {
   args.splice(tIdx, 1);
 }
 
-const COMMANDS = ["shell", "send-keys", "read", "kill"];
+const COMMANDS = ["shell", "send-keys", "tail", "read", "kill"];
 
 try {
   switch (args[0]) {
@@ -118,7 +120,7 @@ try {
       }
       const shellTimedOut = shell(name, command, { timeout });
       if (shellTimedOut) {
-        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} read\` to check output.\n`);
+        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} tail\` to check output.\n`);
       }
       break;
     }
@@ -130,14 +132,21 @@ try {
       }
       const keysTimedOut = sendKeys(name, rest, { timeout });
       if (keysTimedOut) {
-        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} read\` to check output.\n`);
+        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} tail\` to check output.\n`);
       }
       break;
     }
 
+    case "tail":
     case "read": {
-      const full = rest.includes("--full");
-      process.stdout.write(read(name, { full }));
+      const follow = rest.includes("--follow") || rest.includes("-f");
+      let lines = 10;
+      const linesArg = rest.find((a) => a.startsWith("--lines="));
+      if (linesArg) lines = parseInt(linesArg.split("=")[1], 10) || 10;
+      const stillRunning = tail(name, { follow, lines, timeout });
+      if (follow && stillRunning) {
+        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} tail\` to check output.\n`);
+      }
       break;
     }
 

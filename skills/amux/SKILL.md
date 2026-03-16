@@ -9,8 +9,8 @@ description: Run background tasks, long-running processes, servers, and anything
 
 Each panel runs a minimal bash shell with a prompt showing the panel name and exit codes:
 ```
-server ~/myapp $              # success
-server [exit 1] ~/myapp $    # failure with exit code
+server $              # success
+server [exit 1] $    # failure with exit code
 ```
 
 ## Tools
@@ -48,13 +48,15 @@ amux_send_keys(name: "server", keys: ["C-c"])
 | Arrows | `Up` `Down` `Left` `Right` |
 | Literal text | `"hello world"` (sent as typed, no Enter) |
 
-### amux_read
+### amux_tail
 
-Capture the current visible panel buffer. Use `full: true` for complete scrollback.
+Tail output from a panel. Returns last N lines by default, optionally follows live output.
 
 ```
-amux_read(name: "server")
-amux_read(name: "server", full: true)
+amux_tail(name: "server")                              # last 10 lines
+amux_tail(name: "server", lines: 50)                   # last 50 lines
+amux_tail(name: "server", follow: true)                # follow until done or 30s
+amux_tail(name: "server", follow: true, timeout: 60)   # follow with custom timeout
 ```
 
 ### amux_kill
@@ -80,7 +82,7 @@ amux_list()
 ```
 amux_shell(name: "server", command: "npm start")
 # wait, then check
-amux_read(name: "server")
+amux_tail(name: "server")
 amux_shell(name: "server", command: "curl -s localhost:3000/health")
 ```
 
@@ -99,7 +101,7 @@ amux_list()
 amux_shell(name: "repl", command: "python3")
 amux_send_keys(name: "repl", keys: ["import json", "Enter"])
 amux_send_keys(name: "repl", keys: ["print(json.dumps({'a': 1}))", "Enter"])
-amux_read(name: "repl")
+amux_tail(name: "repl")
 amux_send_keys(name: "repl", keys: ["C-d"])
 ```
 
@@ -108,8 +110,8 @@ amux_send_keys(name: "repl", keys: ["C-d"])
 ```
 amux_shell(name: "build", command: "make -j8 2>&1 | tee build.log")
 # later...
-amux_read(name: "build")
-amux_read(name: "build", full: true)
+amux_tail(name: "build")
+amux_tail(name: "build", lines: 100)
 ```
 
 ### Interrupt and restart
@@ -129,7 +131,6 @@ amux_kill(name: "server")           # just one panel
 
 - **Auto-creation**: `amux_shell` and `amux_send_keys` create panels on first use. No setup step.
 - **Persistence**: Panels survive across tool calls. They live in tmux.
-- **Timeout**: Default 5 seconds. When a command times out, the output tells you the panel is still running and to use `amux_read` to check later.
+- **Timeout**: Default 5 seconds for shell. When a command times out, the output tells you the panel is still running and to use `amux_tail` to check later.
 - **Deterministic names**: Panel titles are locked. Shell escape sequences cannot rename them.
 - **Isolated tmux**: amux uses its own tmux socket and config. It never conflicts with personal tmux.
-- **Clean output**: No ANSI color codes in streamed output — clean text only.

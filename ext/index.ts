@@ -75,8 +75,8 @@ async function amuxFireAndForget(name: string, command: string): Promise<void> {
   await amuxAsync([name, "shell", command, "-t0"], 5);
 }
 
-// Sentinel emitted by bashrc PROMPT_COMMAND: \x06AMUX_DONE:<exit>:<name>\x06
-const DONE_SENTINEL_RE = /\x06AMUX_DONE:(\d+):([^\x06]+)\x06/;
+// Sentinel emitted by bashrc PROMPT_COMMAND on its own line
+const DONE_SENTINEL_RE = /^AMUX_DONE:(\d+):(.+)$/m;
 
 /**
  * Wait for a command to complete by watching the panel log for the sentinel.
@@ -609,7 +609,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use amux_shell for long-running processes (dev servers, build watchers, test suites) instead of bash when the process should keep running.",
       "Panel names should be short and descriptive: server, build, test, worker, repl.",
-      "After starting a background process, use amux_read to check on it later.",
+      "After starting a background process, use amux_tail to check on it later.",
       "Use amux_send_keys with C-c to stop a running process.",
     ],
     parameters: Type.Object({
@@ -650,13 +650,13 @@ export default function (pi: ExtensionAPI) {
       const result = await waitForDone(name, signal, 120_000);
 
       // Read panel output for LLM
-      const snap = await amuxAsync([name, "read", "--full"]);
+      const snap = await amuxAsync([name, "tail", "--lines=100"]);
       const exitCode = result?.exitCode ?? null;
       const done = exitCode !== null;
 
       let text = snap.stdout?.trim() || "";
       if (!done) {
-        text += `\n\n(command still running in panel "${name}" — use amux_read to check later)`;
+        text += `\n\n(command still running in panel "${name}" — use amux_tail to check later)`;
       }
 
       return {
@@ -666,29 +666,37 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --- tool: amux_read ---
+  // --- tool: amux_tail ---
 
   pi.registerTool({
-    name: "amux_read",
-    label: "amux read",
-    description: "Capture the current screen buffer of a named panel. Use --full for complete scrollback.",
-    promptSnippet: "Read output from a named background panel (amux read NAME)",
+    name: "amux_tail",
+    label: "amux tail",
+    description: "Tail output from a named panel. Returns last N lines, optionally following live output until the command finishes or timeout.",
+    promptSnippet: "Tail output from a named background panel (amux tail NAME)",
+    promptGuidelines: [
+      "Use amux_tail to check on background processes.",
+      "Default: last 10 lines, no follow, 30s timeout.",
+      "Use follow:true to wait for command completion (like tail -f).",
+    ],
     parameters: Type.Object({
       name: Type.String({ description: "Panel name" }),
-      full: Type.Optional(Type.Boolean({ description: "Read full scrollback instead of just the visible screen" })),
+      follow: Type.Optional(Type.Boolean({ description: "Follow live output until done or timeout (default: false)" })),
+      lines: Type.Optional(Type.Number({ description: "Number of tail lines (default: 10)" })),
+      timeout: Type.Optional(Type.Number({ description: "Timeout in seconds when following (default: 30)" })),
     }),
 
     renderCall(args, theme) {
       const name = args.name || "…";
-      const full = args.full ? theme.fg("dim", " --full") : "";
+      const follow = args.follow ? theme.fg("dim", " --follow") : "";
+      const lines = args.lines ? theme.fg("dim", ` --lines=${args.lines}`) : "";
       return new Text(
-        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · read") + full,
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · tail") + follow + lines,
         0, 0,
       );
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("muted", "⠿ reading…"), 0, 0);
+      if (isPartial) return new Text(theme.fg("muted", "⠿ tailing…"), 0, 0);
       const output = getTextContent(result);
       if (result.isError) return new Text(theme.fg("error", output || "error"), 0, 0);
       const rendered = renderOutput(output, expanded, theme);
@@ -696,12 +704,15 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params) {
-      const args = [params.name, "read"];
-      if (params.full) args.push("--full");
-      const result = await amuxAsync(args);
+      const args = [params.name, "tail"];
+      if (params.follow) args.push("--follow");
+      if (params.lines) args.push(`--lines=${params.lines}`);
+      const t = params.timeout ?? 30;
+      args.push(`-t${t}`);
+      const result = await amuxAsync(args, t + 5);
       return {
         content: [{ type: "text", text: result.stdout || "(empty)" }],
-        details: { panel: params.name, full: !!params.full },
+        details: { panel: params.name, follow: !!params.follow, lines: params.lines ?? 10 },
       };
     },
   });
@@ -757,7 +768,7 @@ export default function (pi: ExtensionAPI) {
         await new Promise((r) => setTimeout(r, 500));
       }
 
-      const snap = await amuxAsync([name, "read"]);
+      const snap = await amuxAsync([name, "tail"]);
       return {
         content: [{ type: "text", text: snap.stdout || "(no output)" }],
         details: { panel: name, keys },

@@ -5,7 +5,7 @@ export {
   // Core API
   shell,
   sendKeys,
-  read,
+  tail,
   kill,
   list,
   watch,

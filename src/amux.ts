@@ -532,16 +532,133 @@ export function sendKeys(
   );
 }
 
-export function read(name: string, opts?: { full?: boolean }): string {
-  const target = resolvePanel(name);
-  const args = ["capture-pane", "-p", "-t", target];
-  if (opts?.full) args.push("-S", "-");
-  const output = tmux(args);
-  const lines = output.split("\n");
-  while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
-    lines.pop();
+/**
+ * Tail the panel log file. Streams output to stdout.
+ * - follow: keep tailing until timeout or prompt (like `tail -f`)
+ * - lines: number of lines to show (default 10)
+ * - timeout: max seconds to follow (default 30, only used when follow=true)
+ * Returns true if the panel is still running (timed out while following).
+ */
+export function tail(
+  name: string,
+  opts?: { follow?: boolean; lines?: number; timeout?: number }
+): boolean {
+  const _follow = opts?.follow ?? false;
+  const _lines = opts?.lines ?? 10;
+  const _timeout = opts?.timeout ?? 30;
+
+  resolvePanel(name); // throws if panel doesn't exist
+  const logPath = panelLogPath(name);
+
+  // Read the tail of the log file
+  const CHUNK = Math.max(65536, _lines * 512);
+  let content: string;
+  try {
+    const fd = openSync(logPath, "r");
+    try {
+      const st = statSync(logPath);
+      const size = st.size;
+      if (size === 0) {
+        closeSync(fd);
+        if (!_follow) return false;
+        // fall through to follow mode with pos=0
+        content = "";
+      } else {
+        const start = Math.max(0, size - CHUNK);
+        const buf = Buffer.alloc(Math.min(CHUNK, size));
+        readSync(fd, buf, 0, buf.length, start);
+        content = buf.toString("utf-8");
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
   }
-  return lines.length === 0 ? "" : lines.join("\n") + "\n";
+
+  // Split, strip ANSI for detection, emit raw tail
+  const allLines = content.split("\n");
+  // Drop empty trailing element from split
+  if (allLines.length > 0 && allLines[allLines.length - 1] === "") allLines.pop();
+
+  // Emit last N lines (skip sentinel/prompt lines)
+  const tailLines = allLines.slice(-_lines);
+  for (const raw of tailLines) {
+    const clean = stripAnsi(raw).trimEnd();
+    if (detectInputWait(clean, name)) continue;
+    if (raw) process.stdout.write(raw + "\n");
+  }
+
+  if (!_follow) return false;
+
+  // Follow mode — tail the log file until sentinel or timeout
+  let pos: number;
+  try { pos = statSync(logPath).size; } catch { return false; }
+
+  let partial = "";
+  const deadline = monotonic() + _timeout;
+  let timedOut = true;
+
+  const fd = openSync(logPath, "r");
+  const buf = Buffer.alloc(65536);
+  try {
+    while (true) {
+      if (monotonic() >= deadline) break;
+
+      let size: number;
+      try { size = statSync(logPath).size; } catch { size = 0; }
+
+      if (size > pos) {
+        const toRead = Math.min(size - pos, buf.length);
+        const bytesRead = readSync(fd, buf, 0, toRead, pos);
+        if (bytesRead > 0) {
+          pos += bytesRead;
+          const chunk = buf.toString("utf-8", 0, bytesRead);
+          const text = partial + chunk;
+          const lines = text.split("\n");
+          partial = lines.pop()!;
+
+          for (const raw of lines) {
+            const clean = stripAnsi(raw).trimEnd();
+            const waiting = detectInputWait(clean, name);
+            if (waiting) {
+              timedOut = false;
+              const grace = 0.2;
+              const cap = monotonic() + grace;
+              if (cap < deadline) { /* let grace period drain */ }
+              continue;
+            }
+            if (raw) process.stdout.write(raw + "\n");
+          }
+
+          // Check partial for prompt
+          if (partial) {
+            const cleanPartial = stripAnsi(partial).trimEnd();
+            if (detectInputWait(cleanPartial, name)) {
+              timedOut = false;
+              break;
+            }
+          }
+
+          if (!timedOut) break;
+        }
+      } else {
+        sleepSync(50);
+      }
+    }
+  } finally {
+    closeSync(fd);
+  }
+
+  // Flush partial
+  if (partial) {
+    const clean = stripAnsi(partial).trimEnd();
+    if (clean && !detectInputWait(clean, name)) {
+      process.stdout.write(partial + "\n");
+    }
+  }
+
+  return timedOut;
 }
 
 export function kill(name: string): void {
