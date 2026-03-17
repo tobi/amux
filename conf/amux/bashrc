@@ -1,13 +1,18 @@
 # amux panel shell — minimal, deterministic
 bind 'set enable-bracketed-paste on' 2>/dev/null
+__amux_first=1
 __amux_prompt() {
   local ec=$?
   local name="${AMUX_PANEL:-amux}"
-  # Emit completion sentinel on its own line.
-  if [ $ec -eq 0 ]; then
-    printf '\nSUCCESS\n'
+  # Skip sentinel on initial shell startup — no command has run yet.
+  if [ "$__amux_first" = 1 ]; then
+    __amux_first=0
   else
-    printf '\nFAIL EXITCODE:%d\n' "$ec"
+    if [ $ec -eq 0 ]; then
+      printf '\nSUCCESS\n'
+    else
+      printf '\nFAIL EXITCODE:%d\n' "$ec"
+    fi
   fi
   PS1="$name \\$ "
 }
