@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --experimental-strip-types --no-warnings
+#!/usr/bin/env -S node --experimental-strip-types --experimental-transform-types --no-warnings
 
 import {
   list, watch, panels, terminate, shell, sendKeys, tail, kill,
