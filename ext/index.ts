@@ -379,18 +379,21 @@ export default function (pi: ExtensionAPI) {
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
 
-    async execute(_toolCallId, params, _signal) {
+    async execute(_toolCallId, params, _signal, onUpdate) {
       const { name, command } = params;
       const timeout = params.timeout ?? 5;
 
       // Auto-trail this panel
       if (lastCtx?.hasUI) showTrail(lastCtx, name);
 
-      // Collect output lines
+      // Stream output lines incrementally via onUpdate
       const lines: string[] = [];
       const result = await amuxRun(name, command, {
         timeout,
-        onLine: (line) => { lines.push(line); },
+        onLine: (line) => {
+          lines.push(line);
+          onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
+        },
       });
 
       let text = lines.join("\n");
@@ -448,14 +451,17 @@ export default function (pi: ExtensionAPI) {
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, onUpdate) {
       const lines: string[] = [];
       const result = await amuxTail(params.name, {
         follow: params.follow,
         lines: params.lines,
         timeout: params.timeout ?? 60,
         offset: params.offset,
-        onLine: (line) => { lines.push(line); },
+        onLine: (line) => {
+          lines.push(line);
+          onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
+        },
       });
 
       let text = lines.join("\n");
