@@ -26,6 +26,7 @@ export {
   MAX_TIMEOUT,
 
   // Detection
+  detectEnd,
   detectInputWait,
   normalizeKey,
   validatePanelName,
@@ -39,7 +40,6 @@ export {
   // Low-level
   tmux,
   socketPath,
-  saveTimeoutLog,
 
   // Errors
   AmuxError,
@@ -51,9 +51,12 @@ export {
   SPECIAL_KEYS,
   VALID_PANEL_NAME,
   INTERACTIVE_PROMPT_RE,
-  DONE_SENTINEL_RE,
+  SUCCESS_RE,
+  FAIL_RE,
 
   // Types
   type TabInfo,
   type PaneInfo,
+  type RunResult,
+  type StreamResult,
 } from "./amux.ts";

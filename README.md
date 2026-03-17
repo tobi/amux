@@ -1,184 +1,165 @@
 # amux — agentic mux
 
-Named tmux panels for AI agents and humans. Panels are created on first use, scoped to your working directory, and persistent across commands. Think `tmux` but you never manage sessions — just name things and go.
-
-```
-amux server shell "npm start"     # start a dev server
-amux server read                  # check its output
-amux server send-keys C-c         # interrupt it
-amux watch                        # see everything live
-```
-
-## Why
-
-AI agents need to run background processes — dev servers, build watchers, test suites, REPLs — and check on them later. `amux` gives agents (and humans) a dead-simple interface: named panels that stay alive.
-
-Output streaming uses [`@xterm/headless`](https://www.npmjs.com/package/@xterm/headless) to parse terminal state. Raw escape sequences go in, clean text comes out. No ANSI regex. The virtual terminal handles cursor movement, line clearing, and redraws the same way a real terminal would.
+Named tmux panels for AI agents and humans. Panels are created automatically on first use, tiled within tabs grouped by working directory.
 
 ## Install
 
-As a CLI tool:
+```bash
+npm install -g https://github.com/tobi/amux
+```
+
+## The run → tail workflow
+
+This is the primary way amux is used. The agent starts a command with `run`, which streams output for a short timeout (default 5s). If the command finishes in time, you get `SUCCESS` or `FAIL EXITCODE:N`. If it times out, the output includes a **continuation hint** with the byte offset where output stopped — the agent then calls `tail` with that offset to pick up exactly where it left off.
+
+### Example: fast command (completes within timeout)
+
+```
+$ amux server run "echo hello"
+echo hello
+hello
+
+SUCCESS
+```
+
+### Example: slow command (timeout → continue with tail)
+
+```
+$ amux tests run "npm test" -t10
+npm test
+
+> test
+> jest --runInBand
+
+PASS src/utils.test.ts
+PASS src/api.test.ts
+
+⏳ timeout 10s — continue with:
+  amux_tail(name: "tests", follow: true, offset: 4820)
+```
+
+The agent sees the timeout and uses the printed hint to resume:
+
+```
+$ amux tests tail -f -c 4820
+PASS src/models.test.ts
+PASS src/routes.test.ts
+
+Tests: 47 passed
+Time: 23.4s
+
+SUCCESS
+```
+
+No output is lost. No output is duplicated. The byte offset is the exact position in the log file where `run` stopped reading.
+
+### Example: chained timeouts
+
+If `tail` also times out (very long-running process), it prints another continuation hint:
+
+```
+$ amux build tail -f -c 4820 -t60
+... 60 seconds of output ...
+
+⏳ timeout 60s — continue with:
+  amux_tail(name: "build", follow: true, offset: 128400)
+```
+
+The agent can keep chaining `tail` calls until the command completes.
+
+## Commands
+
+### `amux NAME run CMD`
+
+Run a command in a panel. Creates the panel if it doesn't exist. Streams all output from the start of the command.
+
+- Default timeout: **5 seconds** (`-t5`)
+- Max timeout: 300 seconds (5 minutes)
+- Prints `SUCCESS` or `FAIL EXITCODE:N` on completion
+- Prints continuation hint with byte offset on timeout
 
 ```bash
-bun install -g https://github.com/tobi/amux
+amux server run "npm start"           # 5s default
+amux server run "npm test" -t30       # 30s timeout
 ```
 
-As a [pi](https://github.com/mariozechner/pi) package (adds tools + skill to the agent):
+### `amux NAME tail`
+
+Tail the panel log. Without `--follow`, prints the last N lines and exits.
+
+- Default lines: **10** (`--lines=10`)
+- Default timeout: **60 seconds** (`-t60`)
+- `-c OFFSET`: start from byte offset (for continuation after run/tail timeout)
+- `--follow` / `-f`: keep tailing until command completes or timeout
 
 ```bash
-pi install https://github.com/tobi/amux
+amux server tail                      # last 10 lines
+amux server tail --lines=50           # last 50 lines  
+amux server tail -f                   # follow until done or 60s
+amux server tail -f -c 4820          # continue from offset
+amux server tail -f -c 4820 -t120   # continue with 2min timeout
 ```
 
-Requires [tmux](https://github.com/tmux/tmux) and [Bun](https://bun.sh).
+### `amux NAME panel-get`
 
-## CLI
-
-### For humans
+Dump the raw tmux panel screen content (what you'd see if you looked at the terminal).
 
 ```bash
-amux watch              # see all panels live (starts in watch mode)
-amux watch -r           # attach read-only
-amux list               # show active panels
-amux terminate --yes    # shut down everything
+amux server panel-get                 # visible screen
+amux server panel-get --full          # full scrollback
 ```
 
-Inside `amux watch`:
+### `amux NAME send-keys K...`
 
-| Key | Action |
-|-----|--------|
-| `M-1`..`M-9` | Switch between panels |
-| `Esc` | Enter scroll/watch mode |
-| `Enter` | Drop into edit mode (type into the panel) |
-| `M-q` | Detach |
-| `M-t` | Terminate all panels |
-
-The status bar is context-sensitive — it shows different hints depending on whether you're watching or editing.
-
-### For agents
+Send keystrokes to a panel. Each argument is a separate key.
 
 ```bash
-amux NAME shell CMD       # run command, stream output back
-amux NAME send-keys K...  # send keystrokes
-amux NAME read            # capture current screen
-amux NAME read --full     # capture full scrollback
-amux NAME kill            # remove a panel
+amux server send-keys C-c            # Ctrl-C
+amux repl send-keys "puts :hi" Enter # type + enter
 ```
 
-**Timeout flag:** `-tN` sets the streaming timeout in seconds (default: 5). When a command times out, amux tells you how to keep watching:
+Key reference: `C-c` `C-d` `C-z` `Enter` `Tab` `Esc` `Space` `BSpace` `Up` `Down` `Left` `Right`
 
-```
-$ amux server shell "npm start" -t3
-listening on :3000
-...
-timeout 3s: still running. Use `amux server read` to check output.
-```
+### `amux NAME kill`
 
-**send-keys reference:**
+Remove a panel.
 
-| Key | Description |
-|-----|-------------|
-| `C-c` `C-d` `C-z` | Ctrl combos |
-| `Enter` `Tab` `Esc` `Space` | Special keys |
-| `Up` `Down` `Left` `Right` | Arrow keys |
-| `BSpace` | Backspace |
-| `"some text"` | Literal text (no Enter added) |
+### `amux list`
 
-## Library
+List all active panels, grouped by tab.
 
-```typescript
-import { shell, read, sendKeys, kill, list, panels } from "amux";
+### `amux watch`
 
-// Run a command, stream output for 5s
-const timedOut = shell("server", "npm start", { timeout: 5 });
+Open tmux to see all tabs and panels live. Tabs are cwd directories, panels are tiled panes within each tab.
 
-// Read the screen
-const output = read("server");
-const fullOutput = read("server", { full: true });
+- `M-1` through `M-9`: switch tabs
+- `Esc`: scroll mode
+- `M-q`: detach
+- `M-t`: terminate all
 
-// Send keystrokes
-sendKeys("repl", ["puts :hi", "Enter"], { timeout: 3 });
+### `amux terminate --yes`
 
-// Ctrl-C
-sendKeys("server", ["C-c"]);
+Destroy all panels and the tmux session.
 
-// Clean up
-kill("server");
-```
+## Architecture
 
-All functions are synchronous. `shell` and `sendKeys` return `true` if they timed out (the process is still running).
+- **One tmux session** (`amux`) with its own socket — never conflicts with personal tmux
+- **Tabs** (tmux windows) are named after the working directory basename
+- **Panels** (tmux panes) are tiled within tabs, each running a minimal bash shell
+- **Logs** are written to `~/.amux/panels/{name}.log` via tmux pipe-pane
+- **Sidecar files** track pane→name mapping since tmux doesn't expose pane env vars
+- **Sentinels**: bash PROMPT_COMMAND prints `SUCCESS` or `FAIL EXITCODE:N` on its own line after each command
+- **Prompt**: `name $ ` (no path, minimal, deterministic)
+- **Timeout cap**: all timeouts capped at 300 seconds (5 minutes)
 
 ## pi extension
 
-amux ships as a [pi](https://github.com/mariozechner/pi) extension. Install the package and pi auto-discovers the extension via `package.json`:
+amux ships as a [pi](https://github.com/mariozechner/pi) package with tools:
 
-```json
-{
-  "pi": {
-    "extensions": ["./ext/index.ts"]
-  }
-}
-```
+- `amux_shell` — wraps `run` with async completion detection
+- `amux_tail` — wraps `tail` with offset support for continuation
+- `amux_send_keys` — send keystrokes
+- `amux_kill` — remove a panel
+- `amux_list` — list panels
 
-The extension provides five tools to the LLM:
-
-| Tool | Description |
-|------|-------------|
-| `amux_shell` | Run a command in a named panel |
-| `amux_read` | Read a panel's screen buffer |
-| `amux_send_keys` | Send keystrokes to a panel |
-| `amux_kill` | Remove a panel |
-| `amux_list` | List all panels |
-
-It also adds a **status bar indicator** showing recently active panels (active = any interaction within the last 3 minutes). Panel activity state is persisted in `~/.amux/cache/`.
-
-Use `/amux` in pi to check panel status.
-
-## How it works
-
-All panels live as windows inside a single tmux session. One tmux server, one session, many windows — each window is a named panel.
-
-```
-tmux server (socket: amux)
-  └── session: amux
-        ├── window 1: server     ← amux server shell "npm start"
-        ├── window 2: build      ← amux build shell "npm run watch"
-        └── window 3: test       ← amux test shell "bun test --watch"
-```
-
-**Panel creation is lazy.** First time you reference a name, amux creates the session (if needed) and the window. The init window gets renamed on first use, subsequent panels get new windows.
-
-**Output streaming** works by having tmux `pipe-pane` write raw output to a temp file. amux polls that file, feeds bytes into an `@xterm/headless` virtual terminal, then reads clean screen text from the terminal buffer. This handles all escape sequences correctly — cursor movement, line clearing, color codes, alternate screen buffers — without any regex.
-
-**Prompt detection** checks the virtual terminal's cursor line against known patterns (the amux bash prompt, password prompts, y/n confirmations) to stop streaming early when the command is done.
-
-Each panel runs a minimal bash shell with a prompt that shows the panel name, exit codes, and working directory:
-
-```
-server ~/myapp $              # success
-server [exit 1] ~/myapp $    # last command failed
-```
-
-## Configuration
-
-amux uses its own tmux config (`conf/amux/tmux.conf`) and bash profile (`conf/amux/bashrc`). Titles are locked down — shell escape sequences can't rename panels. All keybindings use Meta (Alt) since Ctrl+digit doesn't work reliably across terminals.
-
-Logs go to `~/.amux/logs/`. When streaming times out, the raw terminal bytes are saved there for debugging:
-
-```
-amux: raw output saved to ~/.amux/logs/server-stream-20260314-091500-1.raw
-amux: inspect with: xxd ~/.amux/logs/server-stream-20260314-091500-1.raw | less
-```
-
-## Tests
-
-```bash
-bun test                    # all tests
-bun test test/unit.test.ts  # unit tests only (fast)
-bun test test/integration.test.ts  # integration tests (needs tmux)
-```
-
-Integration tests use isolated tmux sockets so they don't interfere with your real amux session.
-
-## License
-
-MIT
+The extension also provides a tab bar widget with `⌥1-9` hotkeys for panel trailing.

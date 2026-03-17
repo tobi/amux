@@ -3,12 +3,12 @@ bind 'set enable-bracketed-paste on' 2>/dev/null
 __amux_prompt() {
   local ec=$?
   local name="${AMUX_PANEL:-amux}"
-  # Emit sentinel on its own line, then the prompt.
-  printf '\nAMUX_DONE:%d:%s\n' "$ec" "$name"
+  # Emit completion sentinel on its own line.
   if [ $ec -eq 0 ]; then
-    PS1="$name \\$ "
+    printf '\nSUCCESS\n'
   else
-    PS1="$name [exit $ec] \\$ "
+    printf '\nFAIL EXITCODE:%d\n' "$ec"
   fi
+  PS1="$name \\$ "
 }
 PROMPT_COMMAND=__amux_prompt

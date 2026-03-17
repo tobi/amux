@@ -5,6 +5,11 @@
 //   - Each unique cwd maps to a tmux window (tab), named after the directory.
 //   - Each named panel is a tmux pane tiled within that window.
 //   - `amux watch` shows all windows as tabs, with panes tiled inside.
+//
+// Primary workflow:
+//   1. `run` — execute command, stream output from start, return on completion or timeout
+//   2. If timeout: output includes continuation hint with byte offset
+//   3. `tail -f -c OFFSET` — resume exactly where run left off
 
 import { existsSync, mkdirSync, statSync, rmSync, openSync, readSync, readFileSync, readdirSync, closeSync, writeFileSync } from "fs";
 import { homedir } from "os";
@@ -36,9 +41,9 @@ export const SPECIAL_KEYS: Record<string, string> = {
 
 export const VALID_PANEL_NAME = /^[a-zA-Z0-9_-]+$/;
 
-// Sentinel emitted by bashrc PROMPT_COMMAND when a command completes.
-// Format: AMUX_DONE:<exit_code>:<panel_name>  (on its own line)
-export const DONE_SENTINEL_RE = /^AMUX_DONE:(\d+):(.+)$/;
+// Sentinels emitted by bashrc PROMPT_COMMAND on their own line.
+export const SUCCESS_RE = /^SUCCESS$/;
+export const FAIL_RE = /^FAIL EXITCODE:(\d+)$/;
 
 // Interactive prompt patterns
 export const INTERACTIVE_PROMPT_RE = new RegExp(
@@ -113,20 +118,34 @@ export function stripAnsi(text: string): string {
 
 // -- line detection -----------------------------------------------------------
 
-export function detectInputWait(
+/** Parse a sentinel/prompt line. Returns info or false if normal output. */
+export function detectEnd(
   line: string,
   panelName: string
-): "prompt" | "interactive" | false {
-  if (DONE_SENTINEL_RE.test(line)) return "prompt";
+): { type: "success" | "fail" | "prompt" | "interactive"; exitCode?: number } | false {
+  if (SUCCESS_RE.test(line)) return { type: "success", exitCode: 0 };
+  const failMatch = FAIL_RE.exec(line);
+  if (failMatch) return { type: "fail", exitCode: parseInt(failMatch[1], 10) };
 
   // Prompt: "NAME $ " or "NAME [exit N] $ "
   const promptRe = new RegExp(
     `^${escapeRegex(panelName)}\\s+(\\[exit \\d+\\]\\s+)?\\$\\s*$`
   );
-  if (promptRe.test(line)) return "prompt";
+  if (promptRe.test(line)) return { type: "prompt" };
 
-  if (INTERACTIVE_PROMPT_RE.test(line)) return "interactive";
+  if (INTERACTIVE_PROMPT_RE.test(line)) return { type: "interactive" };
   return false;
+}
+
+// Backward compat wrapper
+export function detectInputWait(
+  line: string,
+  panelName: string
+): "prompt" | "interactive" | false {
+  const r = detectEnd(line, panelName);
+  if (!r) return false;
+  if (r.type === "interactive") return "interactive";
+  return "prompt";
 }
 
 // -- panel name validation ----------------------------------------------------
@@ -192,14 +211,9 @@ export function ensureSession(): void {
 }
 
 // -- tab (window) management --------------------------------------------------
-//
-// Each unique cwd maps to a tmux window (tab). The window name is derived
-// from the directory basename, disambiguated if needed.
 
 function cwdToTabName(cwd: string): string {
-  // Use last path component, or "root" for /
   const name = basename(resolve(cwd)) || "root";
-  // Sanitize for tmux window name
   return name.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 30);
 }
 
@@ -211,12 +225,11 @@ export interface TabInfo {
 
 export interface PaneInfo {
   paneId: string;
-  paneName: string;  // AMUX_PANEL env
+  paneName: string;
   windowId: string;
   windowName: string;
 }
 
-/** List all windows (tabs) in the session. */
 function listWindows(): TabInfo[] {
   if (!hasSession()) return [];
   const out = tmux([
@@ -235,11 +248,6 @@ function listWindows(): TabInfo[] {
 }
 
 // -- pane registry (sidecar files) --------------------------------------------
-//
-// tmux doesn't expose pane environment variables in format strings, so we
-// track the name→paneId mapping via sidecar files:
-//   ~/.amux/panels/{name}.pane  →  contains pane_id (e.g. %3)
-//   ~/.amux/panels/{name}.tab   →  contains window name (tab)
 
 function panePanePath(name: string): string {
   return join(config.panelDir, `${name}.pane`);
@@ -263,13 +271,11 @@ function loadPaneTab(name: string): string | undefined {
   try { return readFileSync(paneTabPath(name), "utf-8").trim() || undefined; } catch { return undefined; }
 }
 
-/** Check if a tmux pane still exists. */
 function paneAlive(paneId: string): boolean {
   const out = tmux(["list-panes", "-s", "-t", config.sessionName, "-F", "#{pane_id}"], { allowFail: true });
   return out.split("\n").some(l => l.trim() === paneId);
 }
 
-/** List all registered panels (reads sidecar files, validates against tmux). */
 function listAllPanes(): PaneInfo[] {
   if (!hasSession()) return [];
   try {
@@ -277,12 +283,11 @@ function listAllPanes(): PaneInfo[] {
     const panes: PaneInfo[] = [];
     for (const f of files) {
       if (!f.endsWith(".pane")) continue;
-      const name = f.slice(0, -5); // strip .pane
+      const name = f.slice(0, -5);
       const paneId = loadPaneId(name);
       const tabName = loadPaneTab(name);
       if (!paneId || !tabName) continue;
       if (!paneAlive(paneId)) {
-        // Stale — clean up
         try { rmSync(panePanePath(name), { force: true }); } catch {}
         try { rmSync(paneTabPath(name), { force: true }); } catch {}
         try { rmSync(panelLogPath(name), { force: true }); } catch {}
@@ -297,18 +302,12 @@ function listAllPanes(): PaneInfo[] {
   }
 }
 
-/** Find the window (tab) for a given cwd, or create one. */
 function ensureTab(cwd: string): TabInfo {
   ensureSession();
-
   const tabName = cwdToTabName(cwd);
   const windows = listWindows();
-
-  // Look for existing window with this name
   const existing = windows.find(w => w.windowName === tabName);
   if (existing) return existing;
-
-  // Create new window
   const out = tmux([
     "new-window", "-d",
     "-t", config.sessionName,
@@ -321,13 +320,11 @@ function ensureTab(cwd: string): TabInfo {
   return { windowId: parts[0], windowIndex: parseInt(parts[1] || "0", 10), windowName: tabName };
 }
 
-/** Find a named pane. */
 function findPane(name: string): PaneInfo | undefined {
   const paneId = loadPaneId(name);
   const tabName = loadPaneTab(name);
   if (!paneId || !tabName) return undefined;
   if (!paneAlive(paneId)) {
-    // Clean up stale mappings
     try { rmSync(panePanePath(name), { force: true }); } catch {}
     try { rmSync(paneTabPath(name), { force: true }); } catch {}
     return undefined;
@@ -370,19 +367,15 @@ function startPanelLog(paneId: string, name: string): void {
 export function ensurePanel(name: string): string {
   validatePanelName(name);
 
-  // Already exists?
   const existing = findPane(name);
   if (existing) return existing.paneId;
 
   const cwd = process.cwd();
   const tab = ensureTab(cwd);
 
-  // Check again after ensureTab (it may have created the window with a default pane)
   const existingAfter = findPane(name);
   if (existingAfter) return existingAfter.paneId;
 
-  // List panes in this window — if there's only the default shell pane
-  // (from window creation), repurpose it instead of splitting
   const windowPanes = listAllPanes().filter(p => p.windowId === tab.windowId);
   const defaultPane = windowPanes.length === 1 && !windowPanes[0].paneName
     ? windowPanes[0] : null;
@@ -390,16 +383,13 @@ export function ensurePanel(name: string): string {
   let paneId: string;
 
   if (defaultPane) {
-    // Repurpose the default pane
     paneId = defaultPane.paneId;
     tmux(["send-keys", "-t", paneId, "-l", "--",
       `export AMUX_PANEL=${shellEscape(name)}; clear`]);
     tmux(["send-keys", "-t", paneId, "Enter"]);
     sleepSync(300);
-    // Set pane title for tmux border display
     tmux(["select-pane", "-t", paneId, "-T", name], { allowFail: true });
   } else {
-    // Split horizontally to create a new pane, tiled layout
     const out = tmux([
       "split-window", "-d",
       "-t", tab.windowId,
@@ -409,9 +399,7 @@ export function ensurePanel(name: string): string {
       shellCmd(),
     ]);
     paneId = out.trim();
-    // Set pane title for tmux border display
     tmux(["select-pane", "-t", paneId, "-T", name], { allowFail: true });
-    // Re-tile so panes are evenly distributed
     tmux(["select-layout", "-t", tab.windowId, "tiled"], { allowFail: true });
   }
 
@@ -420,55 +408,37 @@ export function ensurePanel(name: string): string {
   return paneId;
 }
 
-// -- streaming (log tailing) --------------------------------------------------
+// -- streaming engine ---------------------------------------------------------
+//
+// Shared by `run` and `tail --follow`. Reads the panel log file starting at
+// `startPos`, emits output lines to stdout (ANSI intact), and stops when:
+//   - A completion sentinel (SUCCESS / FAIL EXITCODE:N) or prompt is seen
+//   - The timeout deadline is reached
+//
+// Returns { timedOut, endPos, exitCode }.
 
-let logSeq = 0;
-
-export function saveTimeoutLog(
-  rawBytes: Buffer | string,
-  panelName: string,
-  context: string
-): string {
-  mkdirSync(config.logDir, { recursive: true });
-  const now = new Date();
-  const ts =
-    String(now.getFullYear()) +
-    String(now.getMonth() + 1).padStart(2, "0") +
-    String(now.getDate()).padStart(2, "0") + "-" +
-    String(now.getHours()).padStart(2, "0") +
-    String(now.getMinutes()).padStart(2, "0") +
-    String(now.getSeconds()).padStart(2, "0");
-  const seq = ++logSeq;
-  const path = join(config.logDir, `${panelName}-${context}-${ts}-${seq}.raw`);
-  writeFileSync(path, rawBytes);
-  return path;
+export interface StreamResult {
+  timedOut: boolean;
+  endPos: number;       // byte offset where streaming stopped
+  exitCode?: number;    // set when command completed (0=success, N=fail)
 }
 
-/**
- * Tail the panel log file while fn() runs. Streams output to stdout.
- * Returns true if timed out (panel still producing output).
- */
-function streamFor(
-  paneId: string,
-  fn: () => void,
-  { timeout, panelName }: { timeout?: number; panelName?: string }
-): boolean {
-  if (!timeout) { fn(); return false; }
-
-  const name = panelName || "unknown";
-  const logPath = panelLogPath(name);
-  let pos = 0;
-  try { pos = statSync(logPath).size; } catch {}
+function streamLog(
+  panelName: string,
+  startPos: number,
+  timeout: number,
+): StreamResult {
+  const logPath = panelLogPath(panelName);
+  let pos = startPos;
 
   const sigHandler = () => { process.exit(130); };
   process.on("SIGINT", sigHandler);
   process.on("SIGTERM", sigHandler);
 
   try {
-    fn();
-
     let deadline = monotonic() + timeout;
     let timedOut = true;
+    let exitCode: number | undefined;
     let partial = "";
 
     const fd = openSync(logPath, "r");
@@ -490,21 +460,25 @@ function streamFor(
 
             for (const raw of lines) {
               const clean = stripAnsi(raw).trimEnd();
-              const waiting = detectInputWait(clean, name);
-              if (waiting) {
+              const end = detectEnd(clean, panelName);
+              if (end) {
                 timedOut = false;
-                const cap = monotonic() + (waiting === "prompt" ? 0.2 : 0.3);
+                if (end.exitCode !== undefined) exitCode = end.exitCode;
+                // Grace period to drain remaining output
+                const cap = monotonic() + 0.2;
                 if (cap < deadline) deadline = cap;
                 continue;
               }
               if (raw) process.stdout.write(raw + "\n");
             }
 
+            // Check partial line for prompt/sentinel
             if (partial) {
               const cleanPartial = stripAnsi(partial).trimEnd();
-              const waiting = detectInputWait(cleanPartial, name);
-              if (waiting) {
+              const end = detectEnd(cleanPartial, panelName);
+              if (end) {
                 timedOut = false;
+                if (end.exitCode !== undefined) exitCode = end.exitCode;
                 const cap = monotonic() + 0.2;
                 if (cap < deadline) deadline = cap;
               }
@@ -518,13 +492,15 @@ function streamFor(
       closeSync(fd);
     }
 
+    // Flush partial
     if (partial) {
       const clean = stripAnsi(partial).trimEnd();
-      if (clean && !detectInputWait(clean, name)) {
+      if (clean && !detectEnd(clean, panelName)) {
         process.stdout.write(partial + "\n");
       }
     }
-    return timedOut;
+
+    return { timedOut, endPos: pos, exitCode };
   } finally {
     process.removeListener("SIGINT", sigHandler);
     process.removeListener("SIGTERM", sigHandler);
@@ -533,19 +509,55 @@ function streamFor(
 
 // -- core API -----------------------------------------------------------------
 
-/** Run a command in a panel. Returns true if timed out. Default timeout: 5s. */
+export interface RunResult {
+  timedOut: boolean;
+  endPos: number;       // byte offset where output stopped — pass to tail -c
+  exitCode?: number;    // set if command completed
+}
+
+/**
+ * Run a command in a panel. Streams all output from start of the command.
+ * Default timeout: 5s, max 300s.
+ *
+ * If the command completes within timeout, prints SUCCESS or FAIL and returns.
+ * If timeout is hit, prints a continuation hint:
+ *   ⏳ deadline 5s — continue with: amux_tail(name: "X", follow: true, offset: N)
+ */
 export function run(
   name: string,
   command: string,
   opts?: { timeout?: number }
-): boolean {
+): RunResult {
   if (!command?.trim()) throw new AmuxError("missing command");
   const timeout = clampTimeout(opts?.timeout ?? 5);
   const paneId = ensurePanel(name);
-  return streamFor(paneId, () => {
-    tmux(["send-keys", "-t", paneId, "-l", "--", command]);
-    tmux(["send-keys", "-t", paneId, "Enter"]);
-  }, { timeout, panelName: name });
+
+  const logPath = panelLogPath(name);
+  // Record log position BEFORE sending the command
+  let startPos = 0;
+  try { startPos = statSync(logPath).size; } catch {}
+
+  // Send command
+  tmux(["send-keys", "-t", paneId, "-l", "--", command]);
+  tmux(["send-keys", "-t", paneId, "Enter"]);
+
+  // Stream from start of this command
+  const result = streamLog(name, startPos, timeout);
+
+  if (result.timedOut) {
+    process.stdout.write(
+      `\n⏳ timeout ${timeout}s — continue with:\n` +
+      `  amux_tail(name: "${name}", follow: true, offset: ${result.endPos})\n`
+    );
+  } else if (result.exitCode !== undefined) {
+    if (result.exitCode === 0) {
+      process.stdout.write(`\nSUCCESS\n`);
+    } else {
+      process.stdout.write(`\nFAIL EXITCODE:${result.exitCode}\n`);
+    }
+  }
+
+  return result;
 }
 
 export function normalizeKey(token: string): string | undefined {
@@ -562,51 +574,75 @@ export function sendKeys(
 ): boolean {
   const timeout = clampTimeout(opts?.timeout ?? 5);
   const paneId = ensurePanel(name);
-  return streamFor(paneId, () => {
-    for (const token of keys) {
-      const key = normalizeKey(token);
-      if (key) {
-        tmux(["send-keys", "-t", paneId, key]);
-      } else {
-        tmux(["send-keys", "-t", paneId, "-l", "--", token]);
-      }
+
+  const logPath = panelLogPath(name);
+  let startPos = 0;
+  try { startPos = statSync(logPath).size; } catch {}
+
+  for (const token of keys) {
+    const key = normalizeKey(token);
+    if (key) {
+      tmux(["send-keys", "-t", paneId, key]);
+    } else {
+      tmux(["send-keys", "-t", paneId, "-l", "--", token]);
     }
-  }, { timeout, panelName: name });
+  }
+
+  const result = streamLog(name, startPos, timeout);
+  return result.timedOut;
 }
 
 /**
- * Tail the panel log file.
- * - lines: number of tail lines (default 10)
- * - follow: keep tailing until done or timeout (default false)
- * - timeout: max seconds (default 60, capped at MAX_TIMEOUT)
- * Returns true if timed out while following.
+ * Tail the panel log.
+ *
+ * Without --follow: prints last N lines from the log (default 10).
+ * With --follow: streams live output until command completes or timeout.
+ * With --offset (-c): start reading from byte offset (for continuing after run timeout).
+ *
+ * Default timeout: 60s, max 300s.
  */
 export function tail(
   name: string,
-  opts?: { follow?: boolean; lines?: number; timeout?: number }
-): boolean {
+  opts?: { follow?: boolean; lines?: number; timeout?: number; offset?: number }
+): RunResult {
   const _follow = opts?.follow ?? false;
   const _lines = opts?.lines ?? 10;
   const _timeout = clampTimeout(opts?.timeout ?? 60);
+  const _offset = opts?.offset;
 
   resolvePane(name); // throws if panel doesn't exist
   const logPath = panelLogPath(name);
 
-  // Read tail of log file
+  // If offset is given, jump straight to streaming from that position
+  if (_offset !== undefined) {
+    const result = streamLog(name, _offset, _timeout);
+    if (result.timedOut) {
+      process.stdout.write(
+        `\n⏳ timeout ${_timeout}s — continue with:\n` +
+        `  amux_tail(name: "${name}", follow: true, offset: ${result.endPos})\n`
+      );
+    } else if (result.exitCode !== undefined) {
+      if (result.exitCode === 0) {
+        process.stdout.write(`\nSUCCESS\n`);
+      } else {
+        process.stdout.write(`\nFAIL EXITCODE:${result.exitCode}\n`);
+      }
+    }
+    return result;
+  }
+
+  // Read tail of log file (last N lines)
   const CHUNK = Math.max(65536, _lines * 512);
-  let content: string;
+  let content = "";
+  let fileSize = 0;
   try {
     const fd = openSync(logPath, "r");
     try {
       const st = statSync(logPath);
-      const size = st.size;
-      if (size === 0) {
-        closeSync(fd);
-        if (!_follow) return false;
-        content = "";
-      } else {
-        const start = Math.max(0, size - CHUNK);
-        const buf = Buffer.alloc(Math.min(CHUNK, size));
+      fileSize = st.size;
+      if (fileSize > 0) {
+        const start = Math.max(0, fileSize - CHUNK);
+        const buf = Buffer.alloc(Math.min(CHUNK, fileSize));
         readSync(fd, buf, 0, buf.length, start);
         content = buf.toString("utf-8");
       }
@@ -614,80 +650,37 @@ export function tail(
       closeSync(fd);
     }
   } catch {
-    return false;
+    return { timedOut: false, endPos: 0 };
   }
 
   const allLines = content.split("\n");
   if (allLines.length > 0 && allLines[allLines.length - 1] === "") allLines.pop();
 
-  const tailLines = allLines.slice(-_lines);
-  for (const raw of tailLines) {
+  // Emit last N lines, filtering sentinels/prompts
+  const tailSlice = allLines.slice(-_lines);
+  for (const raw of tailSlice) {
     const clean = stripAnsi(raw).trimEnd();
-    if (detectInputWait(clean, name)) continue;
+    if (detectEnd(clean, name)) continue;
     if (raw) process.stdout.write(raw + "\n");
   }
 
-  if (!_follow) return false;
+  if (!_follow) return { timedOut: false, endPos: fileSize };
 
-  // Follow mode
-  let pos: number;
-  try { pos = statSync(logPath).size; } catch { return false; }
-
-  let partial = "";
-  let deadline = monotonic() + _timeout;
-  let timedOut = true;
-
-  const fd = openSync(logPath, "r");
-  const buf = Buffer.alloc(65536);
-  try {
-    while (true) {
-      if (monotonic() >= deadline) break;
-      let size: number;
-      try { size = statSync(logPath).size; } catch { size = 0; }
-
-      if (size > pos) {
-        const toRead = Math.min(size - pos, buf.length);
-        const bytesRead = readSync(fd, buf, 0, toRead, pos);
-        if (bytesRead > 0) {
-          pos += bytesRead;
-          const text = partial + buf.toString("utf-8", 0, bytesRead);
-          const lines = text.split("\n");
-          partial = lines.pop()!;
-
-          for (const raw of lines) {
-            const clean = stripAnsi(raw).trimEnd();
-            const waiting = detectInputWait(clean, name);
-            if (waiting) {
-              timedOut = false;
-              continue;
-            }
-            if (raw) process.stdout.write(raw + "\n");
-          }
-
-          if (partial) {
-            const cleanPartial = stripAnsi(partial).trimEnd();
-            if (detectInputWait(cleanPartial, name)) {
-              timedOut = false;
-              break;
-            }
-          }
-          if (!timedOut) break;
-        }
-      } else {
-        sleepSync(50);
-      }
-    }
-  } finally {
-    closeSync(fd);
-  }
-
-  if (partial) {
-    const clean = stripAnsi(partial).trimEnd();
-    if (clean && !detectInputWait(clean, name)) {
-      process.stdout.write(partial + "\n");
+  // Follow mode — stream from current end of file
+  const result = streamLog(name, fileSize, _timeout);
+  if (result.timedOut) {
+    process.stdout.write(
+      `\n⏳ timeout ${_timeout}s — continue with:\n` +
+      `  amux_tail(name: "${name}", follow: true, offset: ${result.endPos})\n`
+    );
+  } else if (result.exitCode !== undefined) {
+    if (result.exitCode === 0) {
+      process.stdout.write(`\nSUCCESS\n`);
+    } else {
+      process.stdout.write(`\nFAIL EXITCODE:${result.exitCode}\n`);
     }
   }
-  return timedOut;
+  return result;
 }
 
 /** Dump the tmux capture-pane content (raw panel screen). */
@@ -705,12 +698,10 @@ export function kill(name: string): void {
   const pane = findPane(name);
   if (!pane) return;
   tmux(["kill-pane", "-t", pane.paneId], { allowFail: true });
-  // Clean up all sidecar files
   try { rmSync(panelLogPath(name), { force: true }); } catch {}
   try { rmSync(panelCwdPath(name), { force: true }); } catch {}
   try { rmSync(panePanePath(name), { force: true }); } catch {}
   try { rmSync(paneTabPath(name), { force: true }); } catch {}
-  // If the window is now empty, tmux auto-removes it
 }
 
 export function terminate(): void {
@@ -721,7 +712,6 @@ export function terminate(): void {
 export function watch(opts?: { readonly?: boolean }): never {
   const ro = opts?.readonly ?? false;
   ensureSession();
-  // Select the tab matching current cwd if possible
   selectBestWindow();
   const args = [...tmuxBase(), "attach-session", "-t", config.sessionName];
   if (ro) args.push("-r");
@@ -734,20 +724,17 @@ export function watch(opts?: { readonly?: boolean }): never {
 }
 
 function selectBestWindow(): void {
-  const cwd = process.cwd();
-  const tabName = cwdToTabName(cwd);
+  const tabName = cwdToTabName(process.cwd());
   const windows = listWindows();
   const match = windows.find(w => w.windowName === tabName);
   if (match) {
     tmux(["select-window", "-t", match.windowId]);
   } else if (windows.length > 0) {
-    // Pick most recently active
     const best = windows.reduce((a, b) => a.windowIndex > b.windowIndex ? a : b);
     tmux(["select-window", "-t", best.windowId]);
   }
 }
 
-/** List all panels grouped by tab. */
 export function panels(): PaneInfo[] {
   return listAllPanes().filter(p => p.paneName);
 }
@@ -758,7 +745,6 @@ export function list(): void {
     console.log("no panels");
     return;
   }
-  // Group by window name (tab)
   const byTab: Record<string, PaneInfo[]> = {};
   for (const p of allPanes) {
     const tab = p.windowName || "?";

@@ -75,8 +75,9 @@ async function amuxFireAndForget(name: string, command: string): Promise<void> {
   await amuxAsync([name, "run", command, "-t0"], 5);
 }
 
-// Sentinel emitted by bashrc PROMPT_COMMAND on its own line
-const DONE_SENTINEL_RE = /^AMUX_DONE:(\d+):(.+)$/m;
+// Sentinels emitted by bashrc PROMPT_COMMAND on their own line
+const SUCCESS_RE = /^SUCCESS$/m;
+const FAIL_RE = /^FAIL EXITCODE:(\d+)$/m;
 
 /**
  * Wait for a command to complete by watching the panel log for the sentinel.
@@ -132,9 +133,13 @@ async function waitForDone(
         pos = size;
         if (bytesRead > 0) {
           const chunk = buf.subarray(0, bytesRead).toString("utf-8");
-          const m = DONE_SENTINEL_RE.exec(chunk);
-          if (m && m[2] === panelName) {
-            done({ exitCode: parseInt(m[1], 10) });
+          if (SUCCESS_RE.test(chunk)) {
+            done({ exitCode: 0 });
+          } else {
+            const m = FAIL_RE.exec(chunk);
+            if (m) {
+              done({ exitCode: parseInt(m[1], 10) });
+            }
           }
         }
       } finally {
@@ -529,7 +534,7 @@ export default function (pi: ExtensionAPI) {
     startWatching(ctx);
     if (!amuxOnPath()) {
       ctx.ui.notify(
-        "amux is not on your PATH. Run /amux install or: npm i -g amux",
+        "amux is not on your PATH. Run /amux install or: npm i -g https://github.com/tobi/amux",
         "warning",
       );
     }
@@ -609,7 +614,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use amux_shell for long-running processes (dev servers, build watchers, test suites) instead of bash when the process should keep running.",
       "Panel names should be short and descriptive: server, build, test, worker, repl.",
-      "After starting a background process, use amux_tail to check on it later.",
+      "If amux_shell times out, the output includes a continuation hint with the byte offset. Use amux_tail with that offset to resume exactly where it left off.",
       "Use amux_send_keys with C-c to stop a running process.",
     ],
     parameters: Type.Object({
@@ -671,26 +676,29 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "amux_tail",
     label: "amux tail",
-    description: "Tail output from a named panel. Returns last N lines, optionally following live output until the command finishes or timeout.",
+    description: "Tail output from a named panel. Returns last N lines, optionally following live output until the command finishes or timeout. Use offset to continue from where a previous run/tail stopped.",
     promptSnippet: "Tail output from a named background panel (amux tail NAME)",
     promptGuidelines: [
       "Use amux_tail to check on background processes.",
-      "Default: last 10 lines, no follow, 30s timeout.",
+      "Default: last 10 lines, no follow, 60s timeout.",
       "Use follow:true to wait for command completion (like tail -f).",
+      "Use offset to continue from where a previous amux_shell or amux_tail timed out — the timeout message tells you the exact offset.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Panel name" }),
       follow: Type.Optional(Type.Boolean({ description: "Follow live output until done or timeout (default: false)" })),
       lines: Type.Optional(Type.Number({ description: "Number of tail lines (default: 10)" })),
-      timeout: Type.Optional(Type.Number({ description: "Timeout in seconds when following (default: 30)" })),
+      timeout: Type.Optional(Type.Number({ description: "Timeout in seconds when following (default: 60)" })),
+      offset: Type.Optional(Type.Number({ description: "Byte offset to start from (continue after run/tail timeout)" })),
     }),
 
     renderCall(args, theme) {
       const name = args.name || "…";
-      const follow = args.follow ? theme.fg("dim", " --follow") : "";
+      const follow = args.follow ? theme.fg("dim", " -f") : "";
       const lines = args.lines ? theme.fg("dim", ` --lines=${args.lines}`) : "";
+      const offset = args.offset != null ? theme.fg("dim", ` -c ${args.offset}`) : "";
       return new Text(
-        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · tail") + follow + lines,
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " · tail") + follow + lines + offset,
         0, 0,
       );
     },
@@ -707,12 +715,13 @@ export default function (pi: ExtensionAPI) {
       const args = [params.name, "tail"];
       if (params.follow) args.push("--follow");
       if (params.lines) args.push(`--lines=${params.lines}`);
-      const t = params.timeout ?? 30;
+      if (params.offset != null) args.push("-c", String(params.offset));
+      const t = params.timeout ?? 60;
       args.push(`-t${t}`);
       const result = await amuxAsync(args, t + 5);
       return {
         content: [{ type: "text", text: result.stdout || "(empty)" }],
-        details: { panel: params.name, follow: !!params.follow, lines: params.lines ?? 10 },
+        details: { panel: params.name, follow: !!params.follow, lines: params.lines ?? 10, offset: params.offset },
       };
     },
   });

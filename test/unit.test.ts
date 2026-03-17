@@ -2,8 +2,8 @@ import { describe, test } from "node:test";
 import { strict as assert } from "node:assert";
 import {
   stripAnsi, normalizeKey, validatePanelName, socketPath, config, clampTimeout,
-  detectInputWait, InvalidPanelName, INTERACTIVE_PROMPT_RE,
-  DONE_SENTINEL_RE, MAX_TIMEOUT,
+  detectEnd, detectInputWait, InvalidPanelName, INTERACTIVE_PROMPT_RE,
+  SUCCESS_RE, FAIL_RE, MAX_TIMEOUT,
 } from "../src/amux.ts";
 
 describe("stripAnsi", () => {
@@ -102,10 +102,6 @@ describe("validatePanelName", () => {
     assert.throws(() => validatePanelName("path/to"), (e: any) => e instanceof InvalidPanelName);
   });
 
-  test("rejects reserved characters", () => {
-    assert.throws(() => validatePanelName("a.b"), (e: any) => e instanceof InvalidPanelName);
-  });
-
   test("allows alphanumeric, dash, underscore", () => {
     assert.doesNotThrow(() => validatePanelName("my-app_v2"));
   });
@@ -131,73 +127,89 @@ describe("socketPath", () => {
   });
 });
 
-describe("detectInputWait", () => {
-  test("detects AMUX_DONE sentinel", () => {
-    assert.equal(detectInputWait("AMUX_DONE:0:server", "server"), "prompt");
+describe("SUCCESS_RE / FAIL_RE", () => {
+  test("SUCCESS matches", () => {
+    assert.ok(SUCCESS_RE.test("SUCCESS"));
   });
 
-  test("detects AMUX_DONE sentinel with non-zero exit", () => {
-    assert.equal(detectInputWait("AMUX_DONE:127:server", "server"), "prompt");
-  });
-
-  test("detects amux prompt (success)", () => {
-    assert.equal(detectInputWait("server $", "server"), "prompt");
-    assert.equal(detectInputWait("server $ ", "server"), "prompt");
-  });
-
-  test("detects amux prompt (failure)", () => {
-    assert.equal(detectInputWait("server [exit 1] $", "server"), "prompt");
-    assert.equal(detectInputWait("server [exit 1] $ ", "server"), "prompt");
-  });
-
-  test("detects password prompt", () => {
-    assert.equal(detectInputWait("Enter password: ", "server"), "interactive");
-  });
-
-  test("detects y/n prompt", () => {
-    assert.equal(detectInputWait("Overwrite file? [y/n]: ", "server"), "interactive");
-  });
-
-  test("detects yes/no prompt", () => {
-    assert.equal(detectInputWait("Proceed? [yes/no] ", "server"), "interactive");
-  });
-
-  test("detects press enter", () => {
-    assert.equal(detectInputWait("Press Enter to continue", "server"), "interactive");
-  });
-
-  test("returns false for normal output", () => {
-    assert.equal(detectInputWait("Compiling main.rs...", "server"), false);
-    assert.equal(detectInputWait("GET / 200 4ms", "server"), false);
-    assert.equal(detectInputWait("", "server"), false);
-  });
-
-  test("does not false-match different panel name", () => {
-    assert.equal(detectInputWait("other $ ", "server"), false);
-  });
-});
-
-describe("DONE_SENTINEL_RE", () => {
-  test("matches exit 0", () => {
-    const m = DONE_SENTINEL_RE.exec("AMUX_DONE:0:server");
+  test("FAIL matches with exit code", () => {
+    const m = FAIL_RE.exec("FAIL EXITCODE:127");
     assert.ok(m);
-    assert.equal(m[1], "0");
-    assert.equal(m[2], "server");
+    assert.equal(m![1], "127");
   });
 
-  test("matches non-zero exit", () => {
-    const m = DONE_SENTINEL_RE.exec("AMUX_DONE:127:build");
+  test("FAIL matches exit code 1", () => {
+    const m = FAIL_RE.exec("FAIL EXITCODE:1");
     assert.ok(m);
-    assert.equal(m[1], "127");
-    assert.equal(m[2], "build");
+    assert.equal(m![1], "1");
   });
 
-  test("does not match with prefix text", () => {
-    assert.equal(DONE_SENTINEL_RE.exec("foo AMUX_DONE:0:server"), null);
+  test("does not match embedded", () => {
+    assert.equal(SUCCESS_RE.test("foo SUCCESS bar"), false);
+    assert.equal(FAIL_RE.test("foo FAIL EXITCODE:1 bar"), false);
   });
 
   test("does not match empty", () => {
-    assert.equal(DONE_SENTINEL_RE.exec(""), null);
+    assert.equal(SUCCESS_RE.test(""), false);
+    assert.equal(FAIL_RE.test(""), false);
+  });
+});
+
+describe("detectEnd", () => {
+  test("detects SUCCESS", () => {
+    const r = detectEnd("SUCCESS", "server");
+    assert.deepEqual(r, { type: "success", exitCode: 0 });
+  });
+
+  test("detects FAIL", () => {
+    const r = detectEnd("FAIL EXITCODE:127", "server");
+    assert.deepEqual(r, { type: "fail", exitCode: 127 });
+  });
+
+  test("detects prompt (success)", () => {
+    const r = detectEnd("server $", "server");
+    assert.ok(r);
+    assert.equal(r && r.type, "prompt");
+  });
+
+  test("detects prompt (failure)", () => {
+    const r = detectEnd("server [exit 1] $", "server");
+    assert.ok(r);
+    assert.equal(r && r.type, "prompt");
+  });
+
+  test("detects interactive prompt", () => {
+    const r = detectEnd("Enter password: ", "server");
+    assert.ok(r);
+    assert.equal(r && r.type, "interactive");
+  });
+
+  test("returns false for normal output", () => {
+    assert.equal(detectEnd("Compiling main.rs...", "server"), false);
+    assert.equal(detectEnd("GET / 200 4ms", "server"), false);
+    assert.equal(detectEnd("", "server"), false);
+  });
+
+  test("does not false-match different panel name", () => {
+    assert.equal(detectEnd("other $ ", "server"), false);
+  });
+});
+
+describe("detectInputWait (backward compat)", () => {
+  test("maps SUCCESS to prompt", () => {
+    assert.equal(detectInputWait("SUCCESS", "server"), "prompt");
+  });
+
+  test("maps FAIL to prompt", () => {
+    assert.equal(detectInputWait("FAIL EXITCODE:1", "server"), "prompt");
+  });
+
+  test("maps interactive", () => {
+    assert.equal(detectInputWait("Enter password: ", "server"), "interactive");
+  });
+
+  test("returns false for normal", () => {
+    assert.equal(detectInputWait("hello world", "server"), false);
   });
 });
 

@@ -15,25 +15,20 @@ For humans:
   amux list                 show active panels
   amux terminate --yes      shut down all panels
 
-  Inside watch mode:
-    M-1..9                  switch between tabs
-    Esc                     scroll mode (copy-mode)
-    M-q                     detach
-    M-t                     terminate all panels
-
 For agents:
-  amux NAME run CMD...      run command in panel, stream output (default: 5s)
-  amux NAME tail [opts]     tail panel log (default: 10 lines, 60s timeout)
-  amux NAME panel-get       dump tmux panel content (--full for scrollback)
+  amux NAME run CMD...      run command, stream output (default: -t5)
+  amux NAME tail [opts]     tail panel log (default: 10 lines, -t60)
+  amux NAME panel-get       dump tmux panel screen (--full for scrollback)
   amux NAME send-keys K...  send keystrokes to a panel
   amux NAME kill            remove a single panel
 
 Options:
-  -tN                       timeout in seconds (default depends on command, max ${MAX_TIMEOUT})
+  -tN                       timeout in seconds (max ${MAX_TIMEOUT})
 
 tail options:
   --follow / -f             follow live output until done or timeout
-  --lines=N                 number of lines (default: 10)
+  --lines=N                 number of tail lines (default: 10)
+  -c OFFSET                 start from byte offset (continue after run timeout)
 
 send-keys reference:
   C-c C-d C-z               ctrl combos
@@ -42,24 +37,18 @@ send-keys reference:
   BSpace                    backspace
   "some text"               literal text (no Enter added)
 
-Examples:
-  amux server run "npm start"             start a dev server
-  amux watch                              see tabs with tiled panels
-  amux server tail                        last 10 lines
-  amux server tail --follow               tail -f until done or 60s
-  amux server tail --lines=50             last 50 lines
-  amux server panel-get                   dump panel screen
-  amux server send-keys C-c               interrupt it
-  amux repl run "irb"                     start a REPL
-  amux repl send-keys "puts :hi" Enter    type + enter
-  amux server kill                        remove one panel
-  amux terminate --yes                    shut down everything
+Workflow:
+  amux server run "npm start"             # streams output, 5s default
+  # if timeout: output shows continuation command with offset
+  amux server tail -f -c 4820             # resume from where run stopped
+  amux server tail                        # quick check: last 10 lines
+  amux server tail --lines=50             # more context
 `;
 
 // Parse -tN timeout flag from anywhere in args
 const args = process.argv.slice(2);
 let timeoutOverride: number | undefined;
-const tIdx = args.findIndex((a) => /^-t\d+$/.test(a));
+const tIdx = args.findIndex((a: string) => /^-t\d+$/.test(a));
 if (tIdx !== -1) {
   timeoutOverride = Math.min(parseInt(args[tIdx].slice(2), 10), MAX_TIMEOUT);
   args.splice(tIdx, 1);
@@ -79,7 +68,7 @@ try {
         if (p.length > 0) {
           console.log("active panels:");
           for (const pane of p) {
-            console.log(`  ${pane.windowName}/${pane.paneName}\t${pane.paneId}`);
+            console.log("  " + pane.windowName + "/" + pane.paneName + "\t" + pane.paneId);
           }
         }
         process.stderr.write("confirm with: amux terminate --yes\n");
@@ -122,10 +111,7 @@ try {
         process.exit(1);
       }
       const timeout = timeoutOverride ?? 5;
-      const timedOut = run(name, command, { timeout });
-      if (timedOut) {
-        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} tail\` to check output.\n`);
-      }
+      run(name, command, { timeout });
       break;
     }
 
@@ -137,7 +123,7 @@ try {
       const timeout = timeoutOverride ?? 5;
       const timedOut = sendKeys(name, rest, { timeout });
       if (timedOut) {
-        process.stdout.write(`\ntimeout ${timeout}s: still running. Use \`amux ${name} tail\` to check output.\n`);
+        process.stdout.write("\n\u23f3 timeout " + timeout + "s \u2014 use `amux " + name + " tail` to check output.\n");
       }
       break;
     }
@@ -146,13 +132,16 @@ try {
     case "read": {
       const follow = rest.includes("--follow") || rest.includes("-f");
       let lines = 10;
-      const linesArg = rest.find((a) => a.startsWith("--lines="));
+      const linesArg = rest.find((a: string) => a.startsWith("--lines="));
       if (linesArg) lines = parseInt(linesArg.split("=")[1], 10) || 10;
-      const timeout = timeoutOverride ?? 60;
-      const stillRunning = tail(name, { follow, lines, timeout });
-      if (follow && stillRunning) {
-        process.stdout.write(`\ntimeout ${timeout}s: still running.\n`);
+      let offset: number | undefined;
+      const cIdx = rest.indexOf("-c");
+      if (cIdx !== -1 && rest[cIdx + 1]) {
+        offset = parseInt(rest[cIdx + 1], 10);
+        if (isNaN(offset)) offset = undefined;
       }
+      const timeout = timeoutOverride ?? 60;
+      tail(name, { follow, lines, timeout, offset });
       break;
     }
 
@@ -164,13 +153,13 @@ try {
 
     case "kill": {
       kill(name);
-      console.log(`- ${name}`);
+      console.log("- " + name);
       break;
     }
   }
 } catch (e) {
   if (e instanceof AmuxError) {
-    process.stderr.write(`amux: ${e.message}\n`);
+    process.stderr.write("amux: " + (e as Error).message + "\n");
     process.exit(1);
   }
   throw e;
