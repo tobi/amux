@@ -379,7 +379,7 @@ export default function (pi: ExtensionAPI) {
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
 
-    async execute(_toolCallId, params, _signal, onUpdate) {
+    async execute(_toolCallId, params, signal, onUpdate) {
       const { name, command } = params;
       const timeout = params.timeout ?? 5;
 
@@ -390,6 +390,7 @@ export default function (pi: ExtensionAPI) {
       const lines: string[] = [];
       const result = await amuxRun(name, command, {
         timeout,
+        signal,
         onLine: (line) => {
           lines.push(line);
           onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
@@ -398,7 +399,9 @@ export default function (pi: ExtensionAPI) {
 
       let text = lines.join("\n");
 
-      if (result.timedOut) {
+      if (result.aborted) {
+        text += `\n\n⊘ aborted \u2014 continue with:\n  amux_tail(name: "${name}", follow: true, offset: ${result.endPos})`;
+      } else if (result.timedOut) {
         text += `\n\n\u23f3 timeout ${timeout}s \u2014 continue with:\n  amux_tail(name: "${name}", follow: true, offset: ${result.endPos})`;
       } else if (result.exitCode !== undefined) {
         text += result.exitCode === 0 ? "\n\nSUCCESS" : `\n\nFAIL EXITCODE:${result.exitCode}`;
@@ -451,13 +454,14 @@ export default function (pi: ExtensionAPI) {
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
 
-    async execute(_toolCallId, params, _signal, onUpdate) {
+    async execute(_toolCallId, params, signal, onUpdate) {
       const lines: string[] = [];
       const result = await amuxTail(params.name, {
         follow: params.follow,
         lines: params.lines,
         timeout: params.timeout ?? 60,
         offset: params.offset,
+        signal,
         onLine: (line) => {
           lines.push(line);
           onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
@@ -465,7 +469,9 @@ export default function (pi: ExtensionAPI) {
       });
 
       let text = lines.join("\n");
-      if (result.timedOut) {
+      if (result.aborted) {
+        text += `\n\n⊘ aborted \u2014 continue with:\n  amux_tail(name: "${params.name}", follow: true, offset: ${result.endPos})`;
+      } else if (result.timedOut) {
         text += `\n\n\u23f3 timeout ${params.timeout ?? 60}s \u2014 continue with:\n  amux_tail(name: "${params.name}", follow: true, offset: ${result.endPos})`;
       } else if (result.exitCode !== undefined) {
         text += result.exitCode === 0 ? "\n\nSUCCESS" : `\n\nFAIL EXITCODE:${result.exitCode}`;

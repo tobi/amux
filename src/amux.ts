@@ -221,7 +221,7 @@ function cwdToTabName(cwd: string): string {
 
 export interface TabInfo { windowId: string; windowIndex: number; windowName: string; }
 export interface PaneInfo { paneId: string; paneName: string; windowId: string; windowName: string; }
-export interface RunResult { timedOut: boolean; endPos: number; exitCode?: number; }
+export interface RunResult { timedOut: boolean; endPos: number; exitCode?: number; aborted?: boolean; }
 
 async function listWindows(): Promise<TabInfo[]> {
   if (!(await hasSession())) return [];
@@ -384,12 +384,14 @@ export async function streamLog(
   startPos: number,
   timeout: number,
   onLine?: (line: string) => void,
+  signal?: AbortSignal,
 ): Promise<RunResult> {
   const logPath = panelLogPath(panelName);
   let pos = startPos;
   let partial = "";
   let timedOut = true;
   let exitCode: number | undefined;
+  let aborted = false;
 
   const emit = onLine || ((line: string) => { process.stdout.write(line + "\n"); });
 
@@ -415,7 +417,13 @@ export async function streamLog(
         const clean = stripAnsi(partial).trimEnd();
         if (clean && !detectEnd(clean, panelName)) emit(partial);
       }
-      resolve({ timedOut, endPos: pos, exitCode });
+      resolve({ timedOut, endPos: pos, exitCode, aborted });
+    }
+
+    // Abort on signal
+    if (signal) {
+      if (signal.aborted) { aborted = true; timedOut = false; finish(); return; }
+      signal.addEventListener("abort", () => { aborted = true; timedOut = false; finish(); }, { once: true });
     }
 
     function processNewData(): void {
@@ -492,7 +500,7 @@ export async function streamLog(
 export async function run(
   name: string,
   command: string,
-  opts?: { timeout?: number; onLine?: (line: string) => void }
+  opts?: { timeout?: number; onLine?: (line: string) => void; signal?: AbortSignal }
 ): Promise<RunResult> {
   if (!command?.trim()) throw new AmuxError("missing command");
   rejectNesting(command);
@@ -505,7 +513,7 @@ export async function run(
   await tmux(["send-keys", "-t", paneId, "-l", "--", command]);
   await tmux(["send-keys", "-t", paneId, "Enter"]);
 
-  const result = await streamLog(name, startPos, timeout, opts?.onLine);
+  const result = await streamLog(name, startPos, timeout, opts?.onLine, opts?.signal);
 
   if (!opts?.onLine) {
     if (result.timedOut) {
@@ -545,7 +553,7 @@ export async function sendKeys(
 
 export async function tail(
   name: string,
-  opts?: { follow?: boolean; lines?: number; timeout?: number; offset?: number; onLine?: (line: string) => void }
+  opts?: { follow?: boolean; lines?: number; timeout?: number; offset?: number; onLine?: (line: string) => void; signal?: AbortSignal }
 ): Promise<RunResult> {
   const _follow = opts?.follow ?? false;
   const _lines = opts?.lines ?? 10;
@@ -558,7 +566,7 @@ export async function tail(
 
   // Offset mode — jump straight to streaming from that position
   if (_offset !== undefined) {
-    const result = await streamLog(name, _offset, _timeout, opts?.onLine);
+    const result = await streamLog(name, _offset, _timeout, opts?.onLine, opts?.signal);
     if (!opts?.onLine) {
       if (result.timedOut) {
         process.stdout.write(
@@ -600,7 +608,7 @@ export async function tail(
   if (!_follow) return { timedOut: false, endPos: fileSize };
 
   // Follow mode
-  const result = await streamLog(name, fileSize, _timeout, opts?.onLine);
+  const result = await streamLog(name, fileSize, _timeout, opts?.onLine, opts?.signal);
   if (!opts?.onLine) {
     if (result.timedOut) {
       process.stdout.write(
