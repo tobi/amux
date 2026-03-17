@@ -2,8 +2,8 @@ import { describe, test } from "node:test";
 import { strict as assert } from "node:assert";
 import {
   stripAnsi, normalizeKey, validatePanelName, socketPath, config, clampTimeout,
-  detectEnd, detectInputWait, InvalidPanelName, INTERACTIVE_PROMPT_RE,
-  SUCCESS_RE, FAIL_RE, MAX_TIMEOUT,
+  detectEnd, detectInputWait, InvalidPanelName, AmuxError, INTERACTIVE_PROMPT_RE,
+  SUCCESS_RE, FAIL_RE, MAX_TIMEOUT, rejectNesting,
 } from "../src/amux.ts";
 
 describe("stripAnsi", () => {
@@ -226,5 +226,29 @@ describe("clampTimeout", () => {
 
   test("floors at 0", () => {
     assert.equal(clampTimeout(-1), 0);
+  });
+});
+
+describe("rejectNesting", () => {
+  test("rejects amux commands", () => {
+    assert.throws(() => rejectNesting("amux server run ls"), (e: any) => e instanceof AmuxError);
+  });
+
+  test("rejects tmux commands", () => {
+    assert.throws(() => rejectNesting("tmux new-session"), (e: any) => e instanceof AmuxError);
+  });
+
+  test("rejects zellij commands", () => {
+    assert.throws(() => rejectNesting("zellij attach"), (e: any) => e instanceof AmuxError);
+  });
+
+  test("rejects case-insensitive", () => {
+    assert.throws(() => rejectNesting("TMUX list-sessions"), (e: any) => e instanceof AmuxError);
+  });
+
+  test("allows normal commands", () => {
+    assert.doesNotThrow(() => rejectNesting("npm test"));
+    assert.doesNotThrow(() => rejectNesting("echo hello"));
+    assert.doesNotThrow(() => rejectNesting("ls -la"));
   });
 });

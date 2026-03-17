@@ -523,12 +523,25 @@ export interface RunResult {
  * If timeout is hit, prints a continuation hint:
  *   ⏳ deadline 5s — continue with: amux_tail(name: "X", follow: true, offset: N)
  */
+// Commands that would nest terminal multiplexers inside amux
+export const NESTING_RE = /\b(amux|tmux|zellij)\b/i;
+
+export function rejectNesting(command: string): void {
+  if (NESTING_RE.test(command)) {
+    throw new AmuxError(
+      "unnecessary terminal muxer nesting — amux already runs inside tmux. " +
+      "Run the underlying command directly."
+    );
+  }
+}
+
 export function run(
   name: string,
   command: string,
   opts?: { timeout?: number }
 ): RunResult {
   if (!command?.trim()) throw new AmuxError("missing command");
+  rejectNesting(command);
   const timeout = clampTimeout(opts?.timeout ?? 5);
   const paneId = ensurePanel(name);
 

@@ -529,6 +529,34 @@ export default function (pi: ExtensionAPI) {
 
   // --- lifecycle ---
 
+  // --- system prompt injection ---
+
+  const AMUX_SYSTEM_PROMPT = `
+## Shell commands via amux
+
+Use amux tools (amux_shell, amux_tail, amux_send_keys, amux_kill, amux_list) to run shell commands instead of bash. amux panels persist across calls and support long-running processes.
+
+Primary workflow — run then tail:
+1. amux_shell(name: "test", command: "npm test") — runs command, streams output (5s default timeout)
+2. If it completes: output ends with SUCCESS or FAIL EXITCODE:N
+3. If it times out: output includes a continuation hint with byte offset:
+   ⏳ timeout 5s — continue with:
+     amux_tail(name: "test", follow: true, offset: 4820)
+4. Call amux_tail with that exact offset to resume — no output lost or duplicated
+5. Chain amux_tail calls until the command completes
+
+Panel names should be short and descriptive: server, build, test, worker, repl.
+Use amux_send_keys with C-c to interrupt a running process.
+`;
+
+  pi.on("turn_start", (event) => {
+    return {
+      systemPrompt: event.systemPrompt + AMUX_SYSTEM_PROMPT,
+    };
+  });
+
+  // --- lifecycle ---
+
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
     startWatching(ctx);

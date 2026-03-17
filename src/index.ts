@@ -53,6 +53,8 @@ export {
   INTERACTIVE_PROMPT_RE,
   SUCCESS_RE,
   FAIL_RE,
+  NESTING_RE,
+  rejectNesting,
 
   // Types
   type TabInfo,
