@@ -156,11 +156,15 @@ let trailPanel: string | null = null;
 let trailRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let trailCachedPanels: PanelState[] = [];
 let trailCachedOutput: string[] = [];
+let trailScrollOffset = 0;  // 0 = auto-follow (show latest), >0 = lines scrolled up
+let trailTotalLines = 0;    // total lines available in log
+let trailPinned = false;    // true when user has scrolled up
 
-function readPanelLogTail(name: string, maxLines: number): string[] {
+/** Read all available lines from panel log (up to a reasonable buffer). */
+function readPanelLogAll(name: string): string[] {
   const logPath = join(PANEL_DIR, `${name}.log`);
   try {
-    const CHUNK = 16384;
+    const CHUNK = 131072;  // 128KB — plenty for scrollback
     const fd = openSync(logPath, "r");
     try {
       const st = fstatSync(fd);
@@ -171,13 +175,37 @@ function readPanelLogTail(name: string, maxLines: number): string[] {
       const text = buf.toString("utf-8").replace(/\x1b\[[\d;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b\(B|\r/g, "");
       const lines = text.split("\n");
       if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-      return lines.slice(-maxLines);
+      // Filter shell noise
+      return lines.filter(l => {
+        const t = l.trim();
+        if (!t) return false;
+        if (/^amux ready \$/.test(t)) return false;
+        if (/^SUCCESS$/.test(t)) return false;
+        if (/^FAIL EXITCODE:\d+$/.test(t)) return false;
+        return true;
+      });
     } finally { closeSync(fd); }
   } catch { return []; }
 }
 
+function readPanelLogTail(name: string, maxLines: number): string[] {
+  const all = readPanelLogAll(name);
+  trailTotalLines = all.length;
+  if (trailPinned) {
+    // Show a window scrolled up by trailScrollOffset from the end
+    const end = Math.max(0, all.length - trailScrollOffset);
+    const start = Math.max(0, end - maxLines);
+    return all.slice(start, end);
+  }
+  // Auto-follow: show last maxLines
+  trailScrollOffset = 0;
+  return all.slice(-maxLines);
+}
+
 function showTrail(ctx: ExtensionContext, panelName: string): void {
   trailPanel = panelName;
+  trailScrollOffset = 0;
+  trailPinned = false;
   refreshTabBar();
   startTrailRefresh(ctx);
 }
@@ -185,6 +213,8 @@ function showTrail(ctx: ExtensionContext, panelName: string): void {
 function hideTrail(ctx: ExtensionContext): void {
   trailPanel = null;
   trailCachedOutput = [];
+  trailScrollOffset = 0;
+  trailPinned = false;
   refreshTabBar();
 }
 
@@ -226,7 +256,11 @@ function installTabBarWidget(ctx: ExtensionContext): void {
       });
       const sep = blueDim(" \u00b7 ");
       const left = " " + tealDim("amux") + "  " + tabs.join(sep);
-      const hint = activeName ? grayDim("\u2325C interrupt \u00b7 \u2325K kill") : "";
+      const scrollHint = (activeName && trailPinned)
+        ? grayDim(`\u2191${trailScrollOffset} `) : "";
+      const hint = activeName
+        ? scrollHint + grayDim("\u2325\u2191\u2193 scroll \u00b7 \u2325C interrupt \u00b7 \u2325K kill")
+        : "";
       const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(hint) - 1);
       const tabLine = truncateToWidth(left + " ".repeat(gap) + hint + " ", width);
       if (!activeName) return [tabLine];
@@ -340,6 +374,30 @@ export default function (pi: ExtensionAPI) {
     handler: async () => {
       if (!trailPanel) return;
       amuxSendKeys(trailPanel, ["C-d"], { timeout: 0 }).catch(() => {});
+    },
+  });
+
+  // --- ⌥↑/⌥↓ scroll trailing widget ---
+
+  const SCROLL_STEP = 5;
+
+  pi.registerShortcut(Key.alt("up" as any), {
+    description: "Scroll amux trail up",
+    handler: async (ctx) => {
+      if (!trailPanel) return;
+      trailPinned = true;
+      trailScrollOffset = Math.min(trailScrollOffset + SCROLL_STEP, Math.max(0, trailTotalLines - trailLines()));
+      refreshTabBar();
+    },
+  });
+
+  pi.registerShortcut(Key.alt("down" as any), {
+    description: "Scroll amux trail down",
+    handler: async (ctx) => {
+      if (!trailPanel) return;
+      trailScrollOffset = Math.max(0, trailScrollOffset - SCROLL_STEP);
+      if (trailScrollOffset === 0) trailPinned = false;
+      refreshTabBar();
     },
   });
 
