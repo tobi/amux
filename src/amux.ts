@@ -122,23 +122,36 @@ export function stripAnsi(text: string): string {
 
 // -- line detection -----------------------------------------------------------
 
+export const PROMPT_STR = "amux ready $ ";
+export const PROMPT_RE = /^amux ready \$\s*$/;
+export const PROMPT_LINE_RE = /^amux ready \$ /;  // matches prompt + command echo
+
+/** Is this line amux shell noise that should be hidden from the LLM? */
+export function isShellNoise(line: string): boolean {
+  const clean = stripAnsi(line).trimEnd();
+  if (!clean) return false;
+  if (PROMPT_RE.test(clean)) return true;        // bare prompt: "amux ready $"
+  if (PROMPT_LINE_RE.test(clean)) return true;    // command echo: "amux ready $ cmd..."
+  if (SUCCESS_RE.test(clean)) return true;        // sentinel
+  if (FAIL_RE.test(clean)) return true;           // sentinel
+  if (/^\[\?2004[hl]/.test(clean)) return true;   // bracketed paste mode toggle
+  return false;
+}
+
 export function detectEnd(
   line: string,
-  panelName: string
+  _panelName?: string
 ): { type: "success" | "fail" | "prompt" | "interactive"; exitCode?: number } | false {
   if (SUCCESS_RE.test(line)) return { type: "success", exitCode: 0 };
   const failMatch = FAIL_RE.exec(line);
   if (failMatch) return { type: "fail", exitCode: parseInt(failMatch[1], 10) };
-  const promptRe = new RegExp(
-    `^${escapeRegex(panelName)}\\s+(\\[exit \\d+\\]\\s+)?\\$\\s*$`
-  );
-  if (promptRe.test(line)) return { type: "prompt" };
+  if (PROMPT_RE.test(line)) return { type: "prompt" };
   if (INTERACTIVE_PROMPT_RE.test(line)) return { type: "interactive" };
   return false;
 }
 
 export function detectInputWait(
-  line: string, panelName: string
+  line: string, panelName?: string
 ): "prompt" | "interactive" | false {
   const r = detectEnd(line, panelName);
   if (!r) return false;
@@ -385,6 +398,9 @@ export async function streamLog(
   timeout: number,
   onLine?: (line: string) => void,
   signal?: AbortSignal,
+  grep?: RegExp,
+  /** If set, the first line matching the sent command is skipped (command echo). */
+  sentCommand?: string,
 ): Promise<RunResult> {
   const logPath = panelLogPath(panelName);
   let pos = startPos;
@@ -393,7 +409,17 @@ export async function streamLog(
   let exitCode: number | undefined;
   let aborted = false;
 
-  const emit = onLine || ((line: string) => { process.stdout.write(line + "\n"); });
+  const rawEmit = onLine || ((line: string) => { process.stdout.write(line + "\n"); });
+  /** Strip shell bookkeeping sequences but keep other ANSI (colors etc). */
+  function cleanLine(line: string): string {
+    return line
+      .replace(/\x1b\[\?2004[hl]/g, "")  // bracketed paste mode
+      .replace(/\r/g, "");                // carriage returns
+  }
+  const emit = grep
+    ? (line: string) => { const cl = cleanLine(line); if (cl && grep.test(stripAnsi(cl))) rawEmit(cl); }
+    : (line: string) => { const cl = cleanLine(line); if (cl) rawEmit(cl); };
+  let commandEchoSkipped = !sentCommand; // true if no command to skip
 
   return new Promise<RunResult>((resolve) => {
     let watcher: FSWatcher | null = null;
@@ -415,7 +441,7 @@ export async function streamLog(
       cleanup();
       if (partial) {
         const clean = stripAnsi(partial).trimEnd();
-        if (clean && !detectEnd(clean, panelName)) emit(partial);
+        if (clean && !detectEnd(clean, panelName) && !isShellNoise(partial)) emit(partial);
       }
       resolve({ timedOut, endPos: pos, exitCode, aborted });
     }
@@ -452,6 +478,14 @@ export async function streamLog(
             if (end.exitCode !== undefined) exitCode = end.exitCode;
             if (!graceTimer) graceTimer = setTimeout(finish, 200);
             continue;
+          }
+          if (isShellNoise(raw)) continue;
+          // Skip the first line that matches the sent command (command echo)
+          if (!commandEchoSkipped && sentCommand) {
+            if (clean === sentCommand || clean.endsWith(sentCommand)) {
+              commandEchoSkipped = true;
+              continue;
+            }
           }
           if (raw) emit(raw);
         }
@@ -497,15 +531,50 @@ export async function streamLog(
 
 // -- core API (all async) -----------------------------------------------------
 
+/** Check if the panel's shell is at a prompt (idle). */
+async function panelIsIdle(paneId: string): Promise<boolean> {
+  const screen = await tmux(["capture-pane", "-p", "-t", paneId], { allowFail: true });
+  const lines = screen.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed) return PROMPT_RE.test(trimmed);
+  }
+  return true; // empty screen = fresh panel, idle
+}
+
 export async function run(
   name: string,
   command: string,
-  opts?: { timeout?: number; onLine?: (line: string) => void; signal?: AbortSignal; skipNestingCheck?: boolean }
+  opts?: { timeout?: number; onLine?: (line: string) => void; signal?: AbortSignal; skipNestingCheck?: boolean; force?: boolean }
 ): Promise<RunResult> {
   if (!command?.trim()) throw new AmuxError("missing command");
   if (!opts?.skipNestingCheck) rejectNesting(command);
   const timeout = clampTimeout(opts?.timeout ?? 5);
-  const paneId = await ensurePanel(name);
+  let paneId = await ensurePanel(name);
+
+  // Check if panel is busy (command already running)
+  if (!(await panelIsIdle(paneId))) {
+    if (!opts?.force) {
+      throw new AmuxError(
+        `panel '${name}' is busy — a command is already running.\n` +
+        `Use force: true, or send Ctrl-C first: amux_send_keys(name: "${name}", keys: ["C-c"])`
+      );
+    }
+    // Force mode: try C-c first, then kill+recreate if needed
+    await tmux(["send-keys", "-t", paneId, "C-c"]);
+    await sleep(500);
+    if (!(await panelIsIdle(paneId))) {
+      await tmux(["send-keys", "-t", paneId, "C-c"]);
+      await sleep(500);
+    }
+    if (!(await panelIsIdle(paneId))) {
+      // C-c didn't work — kill and recreate
+      await kill(name);
+      await sleep(300);
+      paneId = await ensurePanel(name);
+      await sleep(500); // wait for shell init
+    }
+  }
 
   let startPos = 0;
   try { startPos = statSync(panelLogPath(name)).size; } catch {}
@@ -513,7 +582,7 @@ export async function run(
   await tmux(["send-keys", "-t", paneId, "-l", "--", command]);
   await tmux(["send-keys", "-t", paneId, "Enter"]);
 
-  const result = await streamLog(name, startPos, timeout, opts?.onLine, opts?.signal);
+  const result = await streamLog(name, startPos, timeout, opts?.onLine, opts?.signal, undefined, command);
 
   if (!opts?.onLine) {
     if (result.timedOut) {
@@ -553,20 +622,24 @@ export async function sendKeys(
 
 export async function tail(
   name: string,
-  opts?: { follow?: boolean; lines?: number; timeout?: number; offset?: number; onLine?: (line: string) => void; signal?: AbortSignal }
+  opts?: { follow?: boolean; lines?: number; timeout?: number; offset?: number; onLine?: (line: string) => void; signal?: AbortSignal; grep?: RegExp }
 ): Promise<RunResult> {
   const _follow = opts?.follow ?? false;
   const _lines = opts?.lines ?? 10;
   const _timeout = clampTimeout(opts?.timeout ?? 60);
   const _offset = opts?.offset;
-  const emit = opts?.onLine || ((line: string) => { process.stdout.write(line + "\n"); });
+  const _grep = opts?.grep;
+  const rawEmit = opts?.onLine || ((line: string) => { process.stdout.write(line + "\n"); });
+  const emit = _grep
+    ? (line: string) => { if (_grep.test(stripAnsi(line))) rawEmit(line); }
+    : rawEmit;
 
   await resolvePane(name);
   const logPath = panelLogPath(name);
 
   // Offset mode — jump straight to streaming from that position
   if (_offset !== undefined) {
-    const result = await streamLog(name, _offset, _timeout, opts?.onLine, opts?.signal);
+    const result = await streamLog(name, _offset, _timeout, opts?.onLine, opts?.signal, _grep);
     if (!opts?.onLine) {
       if (result.timedOut) {
         process.stdout.write(
@@ -599,16 +672,29 @@ export async function tail(
 
   const allLines = content.split("\n");
   if (allLines.length > 0 && allLines[allLines.length - 1] === "") allLines.pop();
-  for (const raw of allLines.slice(-_lines)) {
-    const clean = stripAnsi(raw).trimEnd();
-    if (detectEnd(clean, name)) continue;
-    if (raw) emit(raw);
+
+  // Find last prompt line (excluding the very last line which might be a current prompt).
+  // Only show output after it — skip previous commands' output.
+  let startIdx = 0;
+  for (let i = allLines.length - 2; i >= 0; i--) {
+    const clean = stripAnsi(allLines[i]).trimEnd();
+    if (PROMPT_LINE_RE.test(clean) || PROMPT_RE.test(clean)) {
+      startIdx = i + 1; // skip the prompt itself, show from next line
+      break;
+    }
+  }
+
+  const relevant = allLines.slice(startIdx);
+  for (const raw of relevant.slice(-_lines)) {
+    if (isShellNoise(raw)) continue;
+    const cl = raw.replace(/\x1b\[\?2004[hl]/g, "").replace(/\r/g, "");
+    if (cl) emit(cl);
   }
 
   if (!_follow) return { timedOut: false, endPos: fileSize };
 
   // Follow mode
-  const result = await streamLog(name, fileSize, _timeout, opts?.onLine, opts?.signal);
+  const result = await streamLog(name, fileSize, _timeout, opts?.onLine, opts?.signal, _grep);
   if (!opts?.onLine) {
     if (result.timedOut) {
       process.stdout.write(

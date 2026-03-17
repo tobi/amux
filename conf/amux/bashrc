@@ -3,7 +3,6 @@ bind 'set enable-bracketed-paste on' 2>/dev/null
 __amux_first=1
 __amux_prompt() {
   local ec=$?
-  local name="${AMUX_PANEL:-amux}"
   # Skip sentinel on initial shell startup — no command has run yet.
   if [ "$__amux_first" = 1 ]; then
     __amux_first=0
@@ -14,6 +13,6 @@ __amux_prompt() {
       printf '\nFAIL EXITCODE:%d\n' "$ec"
     fi
   fi
-  PS1="$name \\$ "
+  PS1="amux ready \\\$ "
 }
 PROMPT_COMMAND=__amux_prompt

@@ -360,6 +360,7 @@ export default function (pi: ExtensionAPI) {
       name: Type.String({ description: "Panel name (e.g. server, build, test)" }),
       command: Type.String({ description: "Shell command to run" }),
       timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default: 5)" })),
+      force: Type.Optional(Type.Boolean({ description: "Kill any running command first (default: false)" })),
     }),
 
     renderCall(args, theme) {
@@ -393,6 +394,7 @@ export default function (pi: ExtensionAPI) {
       const lines: string[] = [];
       const result = await amuxRun(name, fullCommand, {
         skipNestingCheck: true,
+        force: params.force,
         timeout,
         signal,
         onLine: (line) => {
@@ -437,6 +439,7 @@ export default function (pi: ExtensionAPI) {
       lines: Type.Optional(Type.Number({ description: "Number of tail lines (default: 10)" })),
       timeout: Type.Optional(Type.Number({ description: "Timeout in seconds when following (default: 60)" })),
       offset: Type.Optional(Type.Number({ description: "Byte offset to start from (continue after run/tail timeout)" })),
+      grep: Type.Optional(Type.String({ description: "Regex filter — only matching lines are returned" })),
     }),
 
     renderCall(args, theme) {
@@ -444,8 +447,9 @@ export default function (pi: ExtensionAPI) {
       const follow = args.follow ? theme.fg("dim", " -f") : "";
       const lines = args.lines ? theme.fg("dim", ` --lines=${args.lines}`) : "";
       const offset = args.offset != null ? theme.fg("dim", ` -c ${args.offset}`) : "";
+      const grep = args.grep ? theme.fg("dim", ` --grep `) + theme.fg("warning", args.grep) : "";
       return new Text(
-        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " \u00b7 tail") + follow + lines + offset,
+        theme.fg("dim", "amux ") + theme.fg("accent", theme.bold(name)) + theme.fg("dim", " \u00b7 tail") + follow + lines + offset + grep,
         0, 0,
       );
     },
@@ -459,12 +463,14 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, signal, onUpdate) {
+      const grepRe = params.grep ? new RegExp(params.grep) : undefined;
       const lines: string[] = [];
       const result = await amuxTail(params.name, {
         follow: params.follow,
         lines: params.lines,
         timeout: params.timeout ?? 60,
         offset: params.offset,
+        grep: grepRe,
         signal,
         onLine: (line) => {
           lines.push(line);

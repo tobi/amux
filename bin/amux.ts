@@ -93,9 +93,12 @@ async function main() {
   switch (cmd) {
     case "run":
     case "shell": {
+      const forceIdx = rest.indexOf("-f");
+      const force = forceIdx !== -1;
+      if (force) rest.splice(forceIdx, 1);
       const command = rest.length === 1 ? rest[0] : rest.join(" ");
       if (!command) { process.stderr.write(HELP); process.exit(1); }
-      await run(name, command, { timeout: timeoutOverride ?? 5 });
+      await run(name, command, { timeout: timeoutOverride ?? 5, force });
       break;
     }
     case "send-keys": {
@@ -115,7 +118,10 @@ async function main() {
       let offset: number | undefined;
       const ci = rest.indexOf("-c");
       if (ci !== -1 && rest[ci + 1]) { offset = parseInt(rest[ci + 1], 10); if (isNaN(offset)) offset = undefined; }
-      await tail(name, { follow, lines, timeout: timeoutOverride ?? 60, offset });
+      let grep: RegExp | undefined;
+      const gi = rest.indexOf("--grep");
+      if (gi !== -1 && rest[gi + 1]) { grep = new RegExp(rest[gi + 1]); }
+      await tail(name, { follow, lines, timeout: timeoutOverride ?? 60, offset, grep });
       break;
     }
     case "panel-get": {

@@ -166,14 +166,14 @@ describe("detectEnd", () => {
     assert.deepEqual(r, { type: "fail", exitCode: 127 });
   });
 
-  test("detects prompt (success)", () => {
-    const r = detectEnd("server $", "server");
+  test("detects prompt", () => {
+    const r = detectEnd("amux ready $");
     assert.ok(r);
     assert.equal(r && r.type, "prompt");
   });
 
-  test("detects prompt (failure)", () => {
-    const r = detectEnd("server [exit 1] $", "server");
+  test("detects prompt with trailing space", () => {
+    const r = detectEnd("amux ready $ ");
     assert.ok(r);
     assert.equal(r && r.type, "prompt");
   });
@@ -190,8 +190,10 @@ describe("detectEnd", () => {
     assert.equal(detectEnd("", "server"), false);
   });
 
-  test("does not false-match different panel name", () => {
+  test("does not false-match other prompts", () => {
+    assert.equal(detectEnd("server $ ", "server"), false);
     assert.equal(detectEnd("other $ ", "server"), false);
+    assert.equal(detectEnd("amux $ ", "server"), false);
   });
 });
 
