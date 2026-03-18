@@ -253,7 +253,7 @@ function installTabBarWidget(ctx: ExtensionContext): void {
         return key + blueDim(p.name);
       });
       const sep = blueDim(" \u00b7 ");
-      const left = " " + tealDim("amux") + "  " + tabs.join(sep);
+      const left = tealDim("amux") + " " + tabs.join(sep);
       const scrollHint = (activeName && trailPinned)
         ? grayDim(`\u2191${trailScrollOffset} `) : "";
       const hint = activeName
@@ -451,9 +451,6 @@ export default function (pi: ExtensionAPI) {
       rejectNesting(command);
       const cwd = ctx?.cwd || process.cwd();
       const fullCommand = `cd ${cwd} && ${command}`;
-
-      // Auto-trail this panel
-      if (lastCtx?.hasUI) showTrail(lastCtx, name);
 
       // Stream output lines incrementally via onUpdate
       const lines: string[] = [];
