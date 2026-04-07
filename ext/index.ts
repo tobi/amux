@@ -256,8 +256,8 @@ let trailTotalLines = 0;    // total lines available in log
 let trailPinned = false;    // true when user has scrolled up
 
 /** Read all available lines from panel log (up to a reasonable buffer).
- *  Minimal filtering — this is the user-facing trail widget, show almost everything.
- *  Only strip private mode sequences and \r, keep colors and content. */
+ *  Strips alt-screen regions (vim, less, top etc), cursor movement,
+ *  erase sequences, and other full-screen TUI noise. Keeps colors. */
 function readPanelLogAll(name: string): string[] {
   const logPath = join(PANEL_DIR, `${name}.log`);
   try {
@@ -269,14 +269,38 @@ function readPanelLogAll(name: string): string[] {
       const start = Math.max(0, st.size - CHUNK);
       const buf = Buffer.alloc(Math.min(CHUNK, st.size));
       readSync(fd, buf, 0, buf.length, start);
-      const text = buf.toString("utf-8")
-        .replace(/\x1b\[\?[\d;]*[A-Za-z]/g, "")   // strip private modes (?2004h etc)
+      let text = buf.toString("utf-8");
+
+      // Strip alt-screen regions: everything between \e[?1049h and \e[?1049l
+      // Also handle ?47h/?47l and ?1047h/?1047l (older alt-screen variants)
+      text = text.replace(/\x1b\[\?(?:1049|1047|47)h[\s\S]*?\x1b\[\?(?:1049|1047|47)l/g, "");
+      // If we're still inside an alt-screen (no closing sequence), drop from the opener onward
+      text = text.replace(/\x1b\[\?(?:1049|1047|47)h[\s\S]*$/, "");
+
+      text = text
+        .replace(/\x1b\[\?[\d;]*[A-Za-z]/g, "")       // strip remaining private modes (?2004h etc)
         .replace(/\x1b\][\s\S]*?(?:\x1b\\|\x07)/g, "")  // strip OSC (window title)
-        .replace(/\x1b[()#][A-Za-z0-9]/g, "")      // strip charset switching
-        .replace(/\r/g, "");                         // strip \r
+        .replace(/\x1b[()#][A-Za-z0-9]/g, "")          // strip charset switching
+        .replace(/\x1b\[\d*[ABCDEFGHIJKST]/g, "")      // strip cursor movement & erase (up/down/fwd/back/erase)
+        .replace(/\x1b\[\d*;\d*[Hf]/g, "")             // strip cursor positioning (CSI row;col H/f)
+        .replace(/\x1b\[\d*[Hf]/g, "")                 // strip cursor positioning (CSI col H/f)
+        .replace(/\x1b\[[=>][\d;]*[A-Za-z]/g, "")      // strip CSI > and CSI = sequences
+        .replace(/\x1b\[\d*X/g, "")                    // strip erase character
+        .replace(/\x1b\[\d*[LP]/g, "")                 // strip insert/delete line
+        .replace(/\r/g, "");                            // strip \r
+
+      // Collapse runs of blank lines (common after stripping)
       const lines = text.split("\n");
-      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-      return lines;
+      const result: string[] = [];
+      let lastBlank = false;
+      for (const line of lines) {
+        const blank = line.trim() === "";
+        if (blank && lastBlank) continue;
+        result.push(line);
+        lastBlank = blank;
+      }
+      if (result.length > 0 && result[result.length - 1].trim() === "") result.pop();
+      return result;
     } finally { closeSync(fd); }
   } catch { return []; }
 }
