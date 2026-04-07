@@ -35,6 +35,10 @@ const HOT_MS = 5000;
 const TRAIL_MIN_LINES = 5;
 const TRAIL_SCREEN_FRACTION = 0.33;
 const TRAIL_REFRESH_MS = 1000;
+const LIVE_WIDGET_PREFIX = 'amux-live/';
+const LIVE_WIDGET_DELAY_MS = 100;
+const LIVE_WIDGET_HEIGHT = 15;
+const LIVE_WIDGET_REFRESH_MS = 200;
 
 // ANSI helpers
 const BLUE_FG = "\x1b[34m";
@@ -47,10 +51,92 @@ function blueBgBlack(s: string): string { return `\x1b[30;1;44m${s}${RESET}`; }
 function blueDim(s: string): string { return `${BLUE_FG}${DIM}${s}${RESET}`; }
 function grayDim(s: string): string { return `\x1b[38;5;239m${s}${RESET}`; }
 function tealDim(s: string): string { return `\x1b[38;2;94;182;176m${DIM}${s}${RESET}`; }
+function accentFg(s: string): string { return `\x1b[38;2;77;163;255m${s}${RESET}`; }
 
 function trailLines(): number {
   const rows = process.stdout.rows || 24;
   return Math.max(TRAIL_MIN_LINES, Math.floor(rows * TRAIL_SCREEN_FRACTION));
+}
+
+// -- live widget helpers ------------------------------------------------------
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const wholeSeconds = Math.floor(totalSeconds);
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const seconds = wholeSeconds % 60;
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function buildLiveWidgetLines(
+  panelName: string, logLines: string[], width: number, rows: number, elapsedMs: number,
+): string[] {
+  const accent = `\x1b[38;2;77;163;255m`;
+  const reset = '\x1b[0m';
+  const innerWidth = Math.max(10, width - 2);
+  const timer = ` ${formatElapsed(elapsedMs)} `;
+  const title = ` ${panelName} `;
+  const fill = '─'.repeat(Math.max(0, innerWidth - title.length - timer.length));
+  const topInner = `${title}${fill}${timer}`.padEnd(innerWidth, '─').slice(0, innerWidth);
+  const top = `${accent}╭${topInner}╮${reset}`;
+  const bottom = `${accent}╰${'─'.repeat(innerWidth)}╯${reset}`;
+  const display = logLines.slice(-rows);
+  const body: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    const raw = display[i] ?? '';
+    // Truncate visible width and pad
+    const line = truncateToWidth(raw, innerWidth).padEnd(innerWidth);
+    // Re-truncate after padding (padEnd adds spaces but visible width might differ)
+    const fitted = truncateToWidth(line, innerWidth);
+    body.push(`${accent}│${reset}${fitted}${accent}│${reset}`);
+  }
+  return [top, ...body, bottom];
+}
+
+interface LiveWidget {
+  panelName: string;
+  startedAt: number;
+  timer?: ReturnType<typeof setTimeout>;
+  refreshTimer?: ReturnType<typeof setInterval>;
+  disposed: boolean;
+  requestRender?: () => void;
+}
+
+function showLiveWidget(ctx: ExtensionContext, toolCallId: string, widget: LiveWidget): void {
+  if (!ctx.hasUI || widget.disposed) return;
+  ctx.ui.setWidget(`${LIVE_WIDGET_PREFIX}${toolCallId}`, (_tui, theme) => {
+    let cachedLines: string[] | undefined;
+    let cachedWidth: number | undefined;
+    widget.requestRender = () => { cachedLines = undefined; _tui.requestRender(); };
+    return {
+      invalidate() { cachedLines = undefined; cachedWidth = undefined; },
+      render(width: number): string[] {
+        if (cachedLines && cachedWidth === width) return cachedLines;
+        const logLines = readPanelLogAll(widget.panelName).slice(-LIVE_WIDGET_HEIGHT);
+        cachedLines = buildLiveWidgetLines(
+          widget.panelName, logLines, width, LIVE_WIDGET_HEIGHT,
+          Date.now() - widget.startedAt,
+        );
+        cachedWidth = width;
+        return cachedLines;
+      },
+    };
+  });
+  // Refresh the widget periodically for timer updates and new output
+  widget.refreshTimer = setInterval(() => {
+    if (widget.disposed) return;
+    widget.requestRender?.();
+  }, LIVE_WIDGET_REFRESH_MS);
+}
+
+function hideLiveWidget(ctx: ExtensionContext | null, toolCallId: string, widget: LiveWidget): void {
+  widget.disposed = true;
+  if (widget.timer) clearTimeout(widget.timer);
+  if (widget.refreshTimer) clearInterval(widget.refreshTimer);
+  if (ctx?.hasUI) ctx.ui.setWidget(`${LIVE_WIDGET_PREFIX}${toolCallId}`, undefined);
 }
 
 // -- panel discovery ----------------------------------------------------------
@@ -266,7 +352,7 @@ function installTabBarWidget(ctx: ExtensionContext): void {
       const scrollHint = (activeName && trailPinned)
         ? grayDim(`\u2191${trailScrollOffset} `) : "";
       const hint = activeName
-        ? scrollHint + grayDim("\u2325\u2191\u2193 scroll \u00b7 \u2325C interrupt \u00b7 \u2325K kill")
+        ? scrollHint + grayDim("\u2325PgUp/Dn scroll \u00b7 \u2325C interrupt \u00b7 \u2325K kill")
         : "";
       const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(hint) - 1);
       const tabLine = truncateToWidth(left + " ".repeat(gap) + hint + " ", width);
@@ -397,11 +483,11 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --- ⌥↑/⌥↓ scroll trailing widget ---
+  // --- ⌥PgUp/⌥PgDn scroll trailing widget ---
 
   const SCROLL_STEP = 5;
 
-  pi.registerShortcut(Key.alt("up" as any), {
+  pi.registerShortcut(Key.alt("pageup" as any), {
     description: "Scroll amux trail up",
     handler: async (ctx) => {
       if (!trailPanel) return;
@@ -411,7 +497,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerShortcut(Key.alt("down" as any), {
+  pi.registerShortcut(Key.alt("pagedown" as any), {
     description: "Scroll amux trail down",
     handler: async (ctx) => {
       if (!trailPanel) return;
@@ -468,18 +554,32 @@ export default function (pi: ExtensionAPI) {
       const cwd = ctx?.cwd || process.cwd();
       const fullCommand = `cd ${cwd} && ${command}`;
 
+      // Show live terminal widget while running
+      const liveWidget: LiveWidget = { panelName: name, startedAt: Date.now(), disposed: false };
+      if (ctx?.hasUI) {
+        liveWidget.timer = setTimeout(() => showLiveWidget(ctx, _toolCallId, liveWidget), LIVE_WIDGET_DELAY_MS);
+      }
+
+      // Auto-trail this panel
+      if (ctx && lastCtx) showTrail(lastCtx, name);
+
       // Stream output lines incrementally via onUpdate
       const lines: string[] = [];
-      const result = await amuxRun(name, fullCommand, {
-        skipNestingCheck: true,
-        force: params.force,
-        timeout,
-        signal,
-        onLine: (line) => {
-          lines.push(line);
-          onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
-        },
-      });
+      let result: RunResult;
+      try {
+        result = await amuxRun(name, fullCommand, {
+          skipNestingCheck: true,
+          force: params.force,
+          timeout,
+          signal,
+          onLine: (line) => {
+            lines.push(line);
+            onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
+          },
+        });
+      } finally {
+        hideLiveWidget(ctx, _toolCallId, liveWidget);
+      }
 
       let text = lines.join("\n");
 
@@ -549,21 +649,33 @@ export default function (pi: ExtensionAPI) {
       return rendered ? new Text(rendered, 0, 0) : undefined;
     },
 
-    async execute(_toolCallId, params, signal, onUpdate) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const grepRe = params.grep ? new RegExp(params.grep) : undefined;
+
+      // Show live terminal widget when following
+      const liveWidget: LiveWidget = { panelName: params.name, startedAt: Date.now(), disposed: false };
+      if (params.follow && ctx?.hasUI) {
+        liveWidget.timer = setTimeout(() => showLiveWidget(ctx, _toolCallId, liveWidget), LIVE_WIDGET_DELAY_MS);
+      }
+
       const lines: string[] = [];
-      const result = await amuxTail(params.name, {
-        follow: params.follow,
-        lines: params.lines,
-        timeout: params.timeout ?? 60,
-        offset: params.offset,
-        grep: grepRe,
-        signal,
-        onLine: (line) => {
-          lines.push(line);
-          onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
-        },
-      });
+      let result: RunResult;
+      try {
+        result = await amuxTail(params.name, {
+          follow: params.follow,
+          lines: params.lines,
+          timeout: params.timeout ?? 60,
+          offset: params.offset,
+          grep: grepRe,
+          signal,
+          onLine: (line) => {
+            lines.push(line);
+            onUpdate?.({ content: [{ type: "text", text: lines.join("\n") }] });
+          },
+        });
+      } finally {
+        hideLiveWidget(ctx, _toolCallId, liveWidget);
+      }
 
       let text = lines.join("\n");
 
